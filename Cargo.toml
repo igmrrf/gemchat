@@ -1,8 +1,8 @@
 [package]
 name = "gemchat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "simple gemini chat built with ratatui"
+description = "Multi-agent Gemini chat CLI built with ratatui"
 license = "MIT"
 repository = "https://github.com/thelazydo/gemchat"
 homepage = "https://github.com/thelazydo/gemchat"
@@ -14,9 +14,12 @@ exclude = [
 
 [dependencies]
 anyhow = "1.0.100"
-color-eyre = "0.6.5"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5.4", features = ["derive"] }
+color-eyre = "0.6.5"
 crossterm = "0.28.1"
+dirs = "6"
 dotenvy = "0.15.7"
 futures-util = "0.3.31"
 ratatui = "0.29.0"
@@ -25,4 +28,9 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 syntect = "5.3.0"
 tokio = { version = "1.49.0", features = ["full"] }
+toml = "0.8"
 tui-textarea = "0.7.0"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

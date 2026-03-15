@@ -15,14 +15,22 @@ use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 use tui_textarea::TextArea;
 
+// Legacy module — kept for backward compatibility with existing AI streaming
 mod ai;
+
+// New multi-agent modules
+mod agents;
+mod cli;
+mod config;
+mod persistence;
+mod pipeline;
+mod provider;
 mod tools;
+mod worktree;
+
+use crate::cli::Cli;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Cli {}
 
 #[derive(Clone, Copy, PartialEq)]
 enum InputMode {
