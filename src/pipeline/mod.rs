@@ -59,16 +59,31 @@ impl Pipeline {
         let allowed_tools = role.allowed_tools();
         let tools = self.tool_registry.tool_definitions_for(allowed_tools);
 
-        let mut messages = vec![
-            ChatMessage {
-                role: "user".into(),
-                content: format!("[System] {}\n\nUser request: {}", system_prompt, user_message),
-            },
-        ];
+        // Retrieve existing history from context
+        let mut messages = self.context.read().await.get_messages();
 
-        for ctx in self.context.read().await.recent_outputs(3) {
+        // If history is empty, add system prompt first
+        if messages.is_empty() {
+             messages.push(ChatMessage {
+                role: "user".into(), // Some providers require user role for system context if they don't support 'system'
+                content: format!("[System] {}", system_prompt),
+            });
             messages.push(ChatMessage {
                 role: "model".into(),
+                content: "I understand my role and instructions. How can I help you?".into(),
+            });
+        }
+
+        // Add the new user message
+        messages.push(ChatMessage {
+            role: "user".into(),
+            content: user_message.to_string(),
+        });
+
+        // Add context from recent agent outputs (if any) as a reminder
+        for ctx in self.context.read().await.recent_outputs(3) {
+            messages.push(ChatMessage {
+                role: "user".into(), // Use 'user' to inject context info
                 content: format!("[Context from {}] {}", ctx.0, ctx.1),
             });
         }
@@ -100,10 +115,11 @@ impl Pipeline {
                     AiUpdate::Finished => break,
                     AiUpdate::ToolResult { .. } => {} // Should not happen here
                     AiUpdate::PendingApproval { .. } => {} // Should not happen here
+                    AiUpdate::RequestInput { .. } => {} // Should not happen here
                 }
             }
 
-            if let Some((tool_name, tool_args)) = pending_tool_call {
+            if let Some((tool_name, mut tool_args)) = pending_tool_call {
                 let _ = tx_out.send(AiUpdate::ToolCall {
                     name: tool_name.clone(),
                     args: tool_args.clone(),
@@ -111,7 +127,7 @@ impl Pipeline {
 
                 let needs_approval = self
                     .tool_registry
-                    .needs_approval(&tool_name, self.config.approval.default_tier);
+                    .needs_approval(&tool_name, &self.config.approval);
 
                 if needs_approval {
                     let (app_tx, app_rx) = tokio::sync::oneshot::channel();
@@ -123,8 +139,11 @@ impl Pipeline {
 
                     // Wait for user approval
                     match app_rx.await {
-                        Ok(true) => {
+                        Ok((true, updated_args)) => {
                             // Proceed
+                            if let Some(new_args) = updated_args {
+                                tool_args = new_args;
+                            }
                         }
                         _ => {
                             // Denied
@@ -133,9 +152,11 @@ impl Pipeline {
                                 name: tool_name.clone(),
                                 result: result.clone(),
                             });
+                            
+                            // Append to local messages for loop iteration
                             messages.push(ChatMessage {
                                 role: "model".into(),
-                                content: chunk_text,
+                                content: format!("{}\n[Tool Call: {}({})]", chunk_text, tool_name, tool_args),
                             });
                             messages.push(ChatMessage {
                                 role: "user".into(),
@@ -146,10 +167,19 @@ impl Pipeline {
                     }
                 }
 
-                let result = self
-                    .tool_registry
-                    .execute(&tool_name, &tool_args, working_dir)
-                    .await;
+                let result = if self.tool_registry.requires_input(&tool_name, &tool_args) {
+                    let (in_tx, in_rx) = tokio::sync::oneshot::channel();
+                    let _ = tx_out.send(AiUpdate::RequestInput {
+                        name: tool_name.clone(),
+                        args: tool_args.clone(),
+                        tx: in_tx,
+                    });
+                    in_rx.await.unwrap_or_else(|_| "Error: Interactive input failed".into())
+                } else {
+                    self.tool_registry
+                        .execute(&tool_name, &tool_args, working_dir)
+                        .await
+                };
 
 
                 let _ = tx_out.send(AiUpdate::ToolResult {
@@ -157,15 +187,30 @@ impl Pipeline {
                     result: result.clone(),
                 });
 
+                // Append to local messages for loop iteration
                 messages.push(ChatMessage {
                     role: "model".into(),
-                    content: chunk_text,
+                    content: format!("{}\n[Tool Call: {}({})]", chunk_text, tool_name, tool_args),
                 });
                 messages.push(ChatMessage {
                     role: "user".into(),
                     content: format!("[Tool Result for '{}']:\n{}", tool_name, result),
                 });
                 continue;
+            }
+
+            // No tool call or tool finished, final response content is in chunk_text
+            // Store the final interaction in PipelineContext
+            {
+                let mut ctx = self.context.write().await;
+                ctx.add_message(ChatMessage {
+                    role: "user".into(),
+                    content: user_message.to_string(),
+                });
+                ctx.add_message(ChatMessage {
+                    role: "model".into(),
+                    content: chunk_text.clone(),
+                });
             }
             break;
         }
@@ -208,7 +253,8 @@ impl Pipeline {
                     AiUpdate::Usage(u) => inner_usage = Some(u),
                     AiUpdate::Error(e) => return Err(e),
                     AiUpdate::Finished => break,
-                    AiUpdate::PendingApproval { .. } => {} // Should not happen here
+                    AiUpdate::PendingApproval { .. } => {} 
+                    AiUpdate::RequestInput { .. } => {}
                 }
             }
             Ok((inner_output, inner_tool_calls, inner_usage))

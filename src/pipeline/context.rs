@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use crate::provider::ChatMessage;
 
 /// Shared context passed between agents in a pipeline run.
 ///
@@ -9,6 +10,8 @@ pub struct PipelineContext {
     outputs: HashMap<String, String>,
     /// Ordered list of (agent_name, output) for recency queries
     history: Vec<(String, String)>,
+    /// Full chat history for maintaining conversational context
+    full_history: Vec<ChatMessage>,
 }
 
 impl PipelineContext {
@@ -16,6 +19,7 @@ impl PipelineContext {
         Self {
             outputs: HashMap::new(),
             history: Vec::new(),
+            full_history: Vec::new(),
         }
     }
 
@@ -23,6 +27,16 @@ impl PipelineContext {
     pub fn add_output(&mut self, agent: String, output: String) {
         self.outputs.insert(agent.clone(), output.clone());
         self.history.push((agent, output));
+    }
+
+    /// Add a message to the full chat history.
+    pub fn add_message(&mut self, message: ChatMessage) {
+        self.full_history.push(message);
+    }
+
+    /// Get the full chat history.
+    pub fn get_messages(&self) -> Vec<ChatMessage> {
+        self.full_history.clone()
     }
 
     /// Get a specific agent's output.
@@ -44,6 +58,7 @@ impl PipelineContext {
     pub fn clear(&mut self) {
         self.outputs.clear();
         self.history.clear();
+        self.full_history.clear();
     }
 }
 

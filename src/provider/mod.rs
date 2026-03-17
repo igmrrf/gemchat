@@ -36,14 +36,20 @@ pub enum AiUpdate {
     Content(String),
     /// AI wants to call a tool
     ToolCall { name: String, args: String },
-    /// Tool call needs user approval
+    /// Tool call needs user approval. Returns (approved, optional_updated_args)
     PendingApproval {
         name: String,
         args: String,
-        tx: tokio::sync::oneshot::Sender<bool>,
+        tx: tokio::sync::oneshot::Sender<(bool, Option<String>)>,
     },
     /// Result of a tool execution
     ToolResult { name: String, result: String },
+    /// Request direct user input (e.g. for interactive shell)
+    RequestInput {
+        name: String,
+        args: String,
+        tx: tokio::sync::oneshot::Sender<String>,
+    },
     /// Token usage stats
     Usage(Usage),
     /// Stream complete
@@ -70,6 +76,11 @@ impl std::fmt::Debug for AiUpdate {
                 .debug_struct("ToolResult")
                 .field("name", name)
                 .field("result", result)
+                .finish(),
+            Self::RequestInput { name, args, .. } => f
+                .debug_struct("RequestInput")
+                .field("name", name)
+                .field("args", args)
                 .finish(),
             Self::Usage(u) => f.debug_tuple("Usage").field(u).finish(),
             Self::Finished => write!(f, "Finished"),

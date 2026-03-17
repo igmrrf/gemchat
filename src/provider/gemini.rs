@@ -28,14 +28,63 @@ impl GeminiProvider {
         let contents: Vec<serde_json::Value> = messages
             .iter()
             .map(|msg| {
-                json!({
-                    "role": match msg.role.as_str() {
-                        "user" => "user",
-                        "model" | "assistant" => "model",
-                        _ => "user",
-                    },
-                    "parts": [{ "text": msg.content }]
-                })
+                if msg.content.starts_with("[Tool Result for '") {
+                    // Extract tool name and result
+                    // Format: [Tool Result for 'tool_name']:
+                    // content...
+                    let first_line = msg.content.lines().next().unwrap_or("");
+                    let tool_name = first_line
+                        .trim_start_matches("[Tool Result for '")
+                        .trim_end_matches("']:")
+                        .to_string();
+                    let result_content = msg.content.lines().skip(1).collect::<Vec<_>>().join("\n");
+
+                    json!({
+                        "role": "function",
+                        "parts": [{
+                            "functionResponse": {
+                                "name": tool_name,
+                                "response": { "result": result_content }
+                            }
+                        }]
+                    })
+                } else if msg.role == "model" && msg.content.contains("[Tool Call: ") {
+                    // Split text preamble from tool call
+                    let parts: Vec<&str> = msg.content.split("[Tool Call: ").collect();
+                    let text_preamble = parts[0].trim();
+                    let tool_part = parts[1].trim_end_matches(']');
+                    
+                    // Extract name and args: name(args_json)
+                    let paren_pos = tool_part.find('(').unwrap_or(0);
+                    let tool_name = &tool_part[..paren_pos];
+                    let tool_args_json = &tool_part[paren_pos+1..tool_part.len()-1];
+                    let tool_args: serde_json::Value = serde_json::from_str(tool_args_json).unwrap_or(serde_json::Value::Null);
+
+                    let mut gemini_parts = Vec::new();
+                    if !text_preamble.is_empty() {
+                        gemini_parts.push(json!({ "text": text_preamble }));
+                    }
+                    gemini_parts.push(json!({
+                        "functionCall": {
+                            "name": tool_name,
+                            "args": tool_args
+                        }
+                    }));
+
+                    json!({
+                        "role": "model",
+                        "parts": gemini_parts
+                    })
+                } else {
+                    json!({
+                        "role": match msg.role.as_str() {
+                            "user" => "user",
+                            "model" | "assistant" => "model",
+                            _ => "user",
+                        },
+                        "parts": [{ "text": msg.content }]
+                    })
+                }
             })
             .collect();
 

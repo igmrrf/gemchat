@@ -28,11 +28,13 @@ mod pipeline;
 mod provider;
 mod tools;
 mod worktree;
+mod app_terminal;
 
 use crate::cli::Cli;
 use crate::pipeline::Pipeline;
 use crate::agents::AgentRole;
 use crate::provider::AiUpdate;
+use crate::app_terminal::EmbeddedTerminal;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -40,6 +42,7 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 enum InputMode {
     Normal,
     Editing,
+    Terminal,
 }
 
 enum Action {
@@ -55,9 +58,15 @@ enum Action {
     PendingApproval {
         name: String,
         args: String,
-        tx: tokio::sync::oneshot::Sender<bool>,
+        tx: tokio::sync::oneshot::Sender<(bool, Option<String>)>,
+    },
+    RequestInput {
+        args: String,
+        tx: tokio::sync::oneshot::Sender<String>,
     },
     ApproveTool(bool),
+    ApproveToolWithArgs(bool, String, String),
+    TerminalExit(String),
     ListSessions,
     LoadSession(String),
     Tick,
@@ -89,9 +98,13 @@ struct App<'a> {
 
     pipeline: std::sync::Arc<Pipeline>,
 
+    // Terminal state
+    embedded_terminal: Option<EmbeddedTerminal>,
+    terminal_tx: Option<tokio::sync::oneshot::Sender<String>>,
+
     // Approval state
     pending_approval: Option<(String, String)>,
-    approval_tx: Option<tokio::sync::oneshot::Sender<bool>>,
+    approval_tx: Option<tokio::sync::oneshot::Sender<(bool, Option<String>)>>,
 
     // Persistence
     session_id: String,
@@ -126,6 +139,8 @@ impl<'a> App<'a> {
             total_prompt_tokens: 0,
             total_response_tokens: 0,
             pipeline: std::sync::Arc::new(pipeline),
+            embedded_terminal: None,
+            terminal_tx: None,
             pending_approval: None,
             approval_tx: None,
             session_id,
@@ -140,15 +155,82 @@ impl<'a> App<'a> {
                 if self.is_loading {
                     self.spinner_index = (self.spinner_index + 1) % SPINNER_FRAMES.len();
                 }
+
+                // Check if terminal child exited
+                let mut finished_text = None;
+                if let Some(term) = &mut self.embedded_terminal {
+                    if let Ok(Some(_)) = term.child.try_wait() {
+                        finished_text = Some(term.screen_text());
+                    }
+                }
+                if let Some(text) = finished_text {
+                    let _ = self.action_tx.send(Action::TerminalExit(text));
+                }
+            }
+            Action::TerminalExit(text) => {
+                self.embedded_terminal = None;
+                if let Some(tx) = self.terminal_tx.take() {
+                    let _ = tx.send(text);
+                }
+                self.input_mode = InputMode::Editing;
+                self.messages.push(Message {
+                    role: "System".into(),
+                    content: "🏁 Terminal session finished.".into(),
+                });
             }
             Action::UserInput(key) => {
                 match self.input_mode {
+                    InputMode::Terminal => {
+                        if let Some(term) = &self.embedded_terminal {
+                            // Forward key to PTY
+                            let mut bytes = match key.code {
+                                KeyCode::Char(c) => {
+                                    if key.modifiers.contains(event::KeyModifiers::CONTROL) {
+                                        match c {
+                                            'c' => vec![3],
+                                            'd' => vec![4],
+                                            'l' => vec![12],
+                                            'z' => vec![26],
+                                            _ => {
+                                                let mut b = [0u8; 4];
+                                                c.encode_utf8(&mut b).as_bytes().to_vec()
+                                            }
+                                        }
+                                    } else {
+                                        let mut b = [0u8; 4];
+                                        c.encode_utf8(&mut b).as_bytes().to_vec()
+                                    }
+                                }
+                                KeyCode::Enter => vec![b'\r'],
+                                KeyCode::Backspace => vec![8],
+                                KeyCode::Tab => vec![b'\t'],
+                                KeyCode::Esc => {
+                                    self.input_mode = InputMode::Normal;
+                                    return Ok(());
+                                }
+                                KeyCode::Up => vec![27, 91, 65],
+                                KeyCode::Down => vec![27, 91, 66],
+                                KeyCode::Right => vec![27, 91, 67],
+                                KeyCode::Left => vec![27, 91, 68],
+                                _ => vec![],
+                            };
+
+                            // Handle Alt/Meta if needed (simplification)
+                            if key.modifiers.contains(event::KeyModifiers::ALT) && !bytes.is_empty() {
+                                bytes.insert(0, 27);
+                            }
+
+                            if !bytes.is_empty() {
+                                let _ = term.write(&bytes);
+                            }
+                        }
+                    }
                     InputMode::Editing => {
                         match key.code {
                             KeyCode::Esc => {
                                 self.input_mode = InputMode::Normal;
                             }
-                            KeyCode::Enter => {
+                            KeyCode::Enter if !key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                                 let input = self.textarea.lines().join("\n");
                                 if !input.trim().is_empty() {
                                     self.messages.push(Message {
@@ -166,6 +248,10 @@ impl<'a> App<'a> {
                                     self.textarea = new_textarea;
                                 }
                             }
+                            KeyCode::Enter => {
+                                // Ctrl+Enter for newline
+                                self.textarea.input(key);
+                            }
                             _ => {
                                 self.textarea.input(key);
                             }
@@ -173,6 +259,31 @@ impl<'a> App<'a> {
                     }
                     InputMode::Normal => match key.code {
                         KeyCode::Char('q') => self.should_quit = true,
+                        KeyCode::Char('t') if self.embedded_terminal.is_some() => {
+                            self.input_mode = InputMode::Terminal;
+                        }
+                        KeyCode::Char('x') if self.embedded_terminal.is_some() => {
+                            if let Some(term) = &self.embedded_terminal {
+                                let text = term.screen_text();
+                                let _ = self.action_tx.send(Action::TerminalExit(text));
+                            }
+                        }
+                        KeyCode::Char('i') if self.pending_approval.is_some() => {
+                            // Manual override: Approve as interactive
+                            if let Some((name, args)) = self.pending_approval.take() {
+                                let mut val: serde_json::Value = serde_json::from_str(&args).unwrap_or(serde_json::json!({}));
+                                if let serde_json::Value::Object(ref mut obj) = val {
+                                    obj.insert("interactive".to_string(), serde_json::Value::Bool(true));
+                                }
+                                let new_args = val.to_string();
+                                
+                                // We need a way to tell the pipeline to run this interactively.
+                                // The simplest way is to send a NEW action that includes the updated args.
+                                // But Pipeline is already waiting on approval_tx.
+                                // We'll update ApproveTool to optionally take updated args.
+                                let _ = self.action_tx.send(Action::ApproveToolWithArgs(true, name, new_args));
+                            }
+                        }
                         KeyCode::Char('i') => self.input_mode = InputMode::Editing,
                         KeyCode::Char('j') | KeyCode::Down => {
                             self.scroll_down();
@@ -202,6 +313,39 @@ impl<'a> App<'a> {
                 }
             }
             Action::SendMessage(text) => {
+                if self.pending_approval.is_some() {
+                    let text_lower = text.trim().to_lowercase();
+                    let (is_interactive, clean_text) = if text_lower.starts_with("i ") {
+                        (true, text_lower[2..].trim())
+                    } else if text_lower == "i" {
+                        (true, "y")
+                    } else {
+                        (false, text_lower.as_str())
+                    };
+
+                    if clean_text == "y" || clean_text == "yes" {
+                        if is_interactive {
+                            if let Some((name, args)) = self.pending_approval.take() {
+                                let mut val: serde_json::Value = serde_json::from_str(&args).unwrap_or(serde_json::json!({}));
+                                if let serde_json::Value::Object(ref mut obj) = val {
+                                    obj.insert("interactive".to_string(), serde_json::Value::Bool(true));
+                                }
+                                let _ = self.action_tx.send(Action::ApproveToolWithArgs(true, name, val.to_string()));
+                            }
+                        } else {
+                            let _ = self.action_tx.send(Action::ApproveTool(true));
+                        }
+                    } else if clean_text == "n" || clean_text == "no" {
+                        let _ = self.action_tx.send(Action::ApproveTool(false));
+                    } else {
+                        self.messages.push(Message {
+                            role: "System".into(),
+                            content: "⚠️ A tool call is pending. Type 'y' to approve, 'n' to deny, or 'i' to run interactively.".into(),
+                        });
+                    }
+                    return Ok(());
+                }
+
                 if text == "/sessions" {
                     let _ = self.action_tx.send(Action::ListSessions);
                     return Ok(());
@@ -269,6 +413,9 @@ impl<'a> App<'a> {
                             AiUpdate::PendingApproval { name, args, tx: app_tx } => {
                                 let _ = tx.send(Action::PendingApproval { name, args, tx: app_tx });
                             }
+                            AiUpdate::RequestInput { name: _, args, tx: in_tx } => {
+                                let _ = tx.send(Action::RequestInput { args, tx: in_tx });
+                            }
                             AiUpdate::ToolResult { name, result } => {
                                 let _ = tx.send(Action::ToolResult { name, result });
                             }
@@ -290,10 +437,18 @@ impl<'a> App<'a> {
                 }
             }
             Action::AiResponseChunk(chunk) => {
+                let mut needs_new = true;
                 if let Some(last_msg) = self.messages.last_mut() {
                     if last_msg.role == "AI" {
                         last_msg.content.push_str(&chunk);
+                        needs_new = false;
                     }
+                }
+                if needs_new {
+                    self.messages.push(Message {
+                        role: "AI".into(),
+                        content: chunk,
+                    });
                 }
             }
             Action::UpdateUsage(usage) => {
@@ -314,10 +469,15 @@ impl<'a> App<'a> {
                 self.auto_save();
             }
 
-            Action::ToolCall { name, args: _ } => {
+            Action::ToolCall { name, args } => {
+                let display_args = if args.len() > 100 {
+                    format!("{}...", &args[..100])
+                } else {
+                    args.clone()
+                };
                 self.messages.push(Message {
                     role: "System".into(),
-                    content: format!("Executing tool: `{}`", name),
+                    content: format!("Executing tool: `{}` with args: `{}`", name, display_args),
                 });
                 if self.should_auto_scroll {
                     self.scroll_to_bottom();
@@ -336,14 +496,49 @@ impl<'a> App<'a> {
             }
             Action::PendingApproval { name, args, tx } => {
                 self.pending_approval = Some((name, args));
+                self.input_mode = InputMode::Normal;
                 self.auto_save();
                 self.approval_tx = Some(tx);
             }
+            Action::RequestInput { args, tx } => {
+                let val: serde_json::Value = serde_json::from_str(&args).unwrap_or(serde_json::Value::Null);
+                let cmd_str = val.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                
+                if cmd_str.is_empty() {
+                    let _ = tx.send("Error: No command provided".into());
+                    return Ok(());
+                }
+
+                // Initialize embedded terminal
+                match EmbeddedTerminal::new(&cmd_str, &self.pipeline.working_dir, 24, 80) {
+                    Ok(term) => {
+                        self.embedded_terminal = Some(term);
+                        self.terminal_tx = Some(tx);
+                        self.input_mode = InputMode::Terminal;
+                        self.messages.push(Message {
+                            role: "System".into(),
+                            content: format!("🛠️ Embedded terminal started for: `{}`", cmd_str),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(format!("Error: Failed to start terminal: {}", e));
+                    }
+                }
+            }
             Action::ApproveTool(approved) => {
                 if let Some(tx) = self.approval_tx.take() {
-                    let _ = tx.send(approved);
+                    let _ = tx.send((approved, None));
                 }
                 self.pending_approval = None;
+                self.input_mode = InputMode::Editing;
+                self.auto_save();
+            }
+            Action::ApproveToolWithArgs(approved, _name, new_args) => {
+                if let Some(tx) = self.approval_tx.take() {
+                    let _ = tx.send((approved, Some(new_args)));
+                }
+                self.pending_approval = None;
+                self.input_mode = InputMode::Editing;
                 self.auto_save();
             }
             Action::ListSessions => {
@@ -465,7 +660,7 @@ impl<'a> App<'a> {
         let mut count = 0;
         for msg in &self.messages {
             count += 1; // Header
-            count += parse_markdown(&msg.content, &self.ps, &self.ts).len(); // Content lines
+            count += parse_markdown(&msg.content, &self.ps, &self.ts, 80).len(); // Content lines
             count += 1; // Spacer
         }
         count
@@ -532,6 +727,8 @@ impl<'a> App<'a> {
             )),
             Line::from("Esc: Normal Mode"),
             Line::from("i:   Edit Mode"),
+            Line::from("t:   Terminal Mode"),
+            Line::from("x:   Close Terminal"),
             Line::from("Ent: Send"),
             Line::from("j/k: Scroll"),
             Line::from("G:   Bottom"),
@@ -542,17 +739,28 @@ impl<'a> App<'a> {
     }
 
     fn draw_main_chat(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        let constraints = if self.embedded_terminal.is_some() {
+            vec![
+                Constraint::Percentage(40), // Messages
+                Constraint::Percentage(50), // Terminal
+                Constraint::Length(3),       // Input
+            ]
+        } else {
+            vec![
+                Constraint::Min(1),    // Messages
+                Constraint::Length(3), // Input
+            ]
+        };
+
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(vec![
-                Constraint::Min(1),    // Messages area
-                Constraint::Length(3), // Input area
-            ])
+            .constraints(constraints)
             .split(area);
 
         let mut list_items = Vec::new();
+        let list_width = layout[0].width as usize;
         for (i, msg) in self.messages.iter().enumerate() {
-            let content_lines = parse_markdown(&msg.content, &self.ps, &self.ts);
+            let content_lines = parse_markdown(&msg.content, &self.ps, &self.ts, list_width);
 
             let mut role_spans = vec![Span::styled(
                 format!("{}: ", msg.role),
@@ -588,28 +796,71 @@ impl<'a> App<'a> {
             }
         }
 
-        let title = match self.input_mode {
+        let main_title = match self.input_mode {
             InputMode::Editing => "Chat (Editing)",
+            InputMode::Terminal => "Chat (Terminal Active)",
             InputMode::Normal => "Chat (Normal)",
         };
 
         let messages_list = List::new(list_items)
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(Block::default().borders(Borders::ALL).title(main_title))
             .style(Style::default().fg(Color::White))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
         frame.render_stateful_widget(messages_list, layout[0], &mut self.list_state);
 
+        // Draw terminal area if active
+        let input_area_idx = if let Some(term) = &self.embedded_terminal {
+            let screen = term.parser.lock().unwrap();
+            let term_area = layout[1];
+            
+            // Manual rendering of vt100 screen to ratatui buffer
+            let vt_screen = screen.screen();
+            let (rows, cols) = vt_screen.size();
+            
+            for row in 0..rows.min(term_area.height) {
+                for col in 0..cols.min(term_area.width) {
+                    if let Some(cell) = vt_screen.cell(row, col) {
+                        let x = term_area.x + col;
+                        let y = term_area.y + row;
+                        
+                        let fg = cell.fgcolor();
+                        let bg = cell.bgcolor();
+                        
+                        let mut style = Style::default();
+                        
+                        // Map vt100 colors to ratatui colors
+                        if let Some(c) = map_vt100_color(fg) { style = style.fg(c); }
+                        if let Some(c) = map_vt100_color(bg) { style = style.bg(c); }
+                        
+                        if cell.bold() { style = style.add_modifier(Modifier::BOLD); }
+                        if cell.italic() { style = style.add_modifier(Modifier::ITALIC); }
+                        
+                        frame.buffer_mut().cell_mut((x, y)).map(|c| {
+                            c.set_char(cell.contents().chars().next().unwrap_or(' ')).set_style(style);
+                        });
+                    }
+                }
+            }
+            
+            2
+        } else {
+            1
+        };
+
         let input_block_style = match self.input_mode {
             InputMode::Editing => Style::default().fg(Color::Yellow),
+            InputMode::Terminal => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             InputMode::Normal => Style::default().fg(Color::DarkGray),
         };
 
         let mut textarea = self.textarea.clone();
-        let title = if let Some((name, _)) = &self.pending_approval {
-            format!("Tool Approval: {} (y/n)", name)
+        let input_title = if self.input_mode == InputMode::Terminal {
+            "Terminal Input (Focus terminal to interact, Esc for Normal)".to_string()
+        } else if let Some((name, _)) = &self.pending_approval {
+            format!("Tool Approval: {} (y/n/i)", name)
         } else {
-            "Input".to_string()
+            "Chat Input (Enter to send, Esc for Normal)".to_string()
         };
 
         let block_style = if self.pending_approval.is_some() {
@@ -621,24 +872,35 @@ impl<'a> App<'a> {
         textarea.set_block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(title)
+                .title(input_title)
                 .style(block_style),
         );
 
         if let Some((name, args)) = &self.pending_approval {
-             textarea.set_placeholder_text(format!("Approve tool '{}' with args '{}'? (y)es / (n)o", name, args));
+             textarea.set_placeholder_text(format!("Approve tool '{}' with args '{}'? (y)es / (n)o / (i)nteractive", name, args));
         }
 
-        frame.render_widget(&textarea, layout[1]);
+        frame.render_widget(&textarea, layout[input_area_idx]);
     }
 }
 
-// Markdown Parser with Syntax Highlighting
-fn parse_markdown<'a>(text: &'a str, ps: &SyntaxSet, ts: &ThemeSet) -> Vec<Line<'a>> {
+fn map_vt100_color(color: tui_term::vt100::Color) -> Option<Color> {
+    match color {
+        tui_term::vt100::Color::Default => None,
+        tui_term::vt100::Color::Idx(i) => Some(Color::Indexed(i)),
+        tui_term::vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
+    }
+}
+
+// Markdown Parser with Syntax Highlighting and Wrapping
+fn parse_markdown(text: &str, ps: &SyntaxSet, ts: &ThemeSet, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut in_code_block = false;
     let mut current_lang = String::new();
     let mut code_block_content = String::new();
+
+    // Account for padding/borders
+    let wrap_width = if width > 4 { width - 4 } else { width };
 
     for line in text.lines() {
         if line.trim().starts_with("```") {
@@ -658,7 +920,7 @@ fn parse_markdown<'a>(text: &'a str, ps: &SyntaxSet, ts: &ThemeSet) -> Vec<Line<
                 for code_line in LinesWithEndings::from(&code_block_content) {
                     let ranges: Vec<(syntect::highlighting::Style, &str)> =
                         h.highlight_line(code_line, ps).unwrap_or_default();
-                    let spans: Vec<Span> = ranges
+                    let spans: Vec<Span<'static>> = ranges
                         .into_iter()
                         .map(|(style, content)| {
                             Span::styled(content.to_string(), translate_style(style))
@@ -679,7 +941,7 @@ fn parse_markdown<'a>(text: &'a str, ps: &SyntaxSet, ts: &ThemeSet) -> Vec<Line<
                 in_code_block = true;
                 current_lang = line.trim().trim_start_matches("```").to_string();
                 lines.push(Line::from(Span::styled(
-                    line,
+                    line.to_string(),
                     Style::default().fg(Color::DarkGray),
                 )));
             }
@@ -687,8 +949,27 @@ fn parse_markdown<'a>(text: &'a str, ps: &SyntaxSet, ts: &ThemeSet) -> Vec<Line<
             code_block_content.push_str(line);
             code_block_content.push('\n');
         } else {
-            let parts = parse_inline_styles(line);
-            lines.push(Line::from(parts));
+            // Normal text line - wrap it if needed
+            if line.trim().is_empty() {
+                lines.push(Line::from(""));
+                continue;
+            }
+
+            let mut current_line_text = String::new();
+            for word in line.split_whitespace() {
+                if current_line_text.is_empty() {
+                    current_line_text.push_str(word);
+                } else if current_line_text.len() + 1 + word.len() <= wrap_width {
+                    current_line_text.push(' ');
+                    current_line_text.push_str(word);
+                } else {
+                    lines.push(Line::from(parse_inline_styles(&current_line_text)));
+                    current_line_text = word.to_string();
+                }
+            }
+            if !current_line_text.is_empty() {
+                lines.push(Line::from(parse_inline_styles(&current_line_text)));
+            }
         }
     }
 
@@ -703,9 +984,11 @@ fn parse_markdown<'a>(text: &'a str, ps: &SyntaxSet, ts: &ThemeSet) -> Vec<Line<
         for code_line in LinesWithEndings::from(&code_block_content) {
             let ranges: Vec<(syntect::highlighting::Style, &str)> =
                 h.highlight_line(code_line, ps).unwrap_or_default();
-            let spans: Vec<Span> = ranges
+            let spans: Vec<Span<'static>> = ranges
                 .into_iter()
-                .map(|(style, content)| Span::styled(content.to_string(), translate_style(style)))
+                .map(|(style, content)| {
+                    Span::styled(content.to_string(), translate_style(style))
+                })
                 .collect();
             lines.push(Line::from(spans));
         }
@@ -722,7 +1005,7 @@ fn translate_style(style: syntect::highlighting::Style) -> Style {
     ))
 }
 
-fn parse_inline_styles(line: &str) -> Vec<Span<'_>> {
+fn parse_inline_styles(line: &str) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut current_text = String::new();
     let mut chars = line.chars().peekable();
@@ -808,7 +1091,11 @@ async fn run(mut terminal: DefaultTerminal) -> Result<()> {
     });
 
     loop {
-        terminal.draw(|frame| app.draw(frame))?;
+        if let Err(_) = terminal.draw(|frame| app.draw(frame)) {
+            // Re-init if drawing fails (happens after restore())
+            terminal = ratatui::init();
+            terminal.draw(|frame| app.draw(frame))?;
+        }
 
         if let Some(action) = rx.recv().await {
             app.update(action)?;
