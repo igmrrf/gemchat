@@ -31,18 +31,51 @@ pub struct Usage {
 }
 
 /// Events streamed from AI providers back to the caller.
-#[derive(Debug)]
 pub enum AiUpdate {
     /// Incremental text content
     Content(String),
     /// AI wants to call a tool
     ToolCall { name: String, args: String },
+    /// Tool call needs user approval
+    PendingApproval {
+        name: String,
+        args: String,
+        tx: tokio::sync::oneshot::Sender<bool>,
+    },
+    /// Result of a tool execution
+    ToolResult { name: String, result: String },
     /// Token usage stats
     Usage(Usage),
     /// Stream complete
     Finished,
     /// An error occurred
     Error(String),
+}
+
+impl std::fmt::Debug for AiUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Content(s) => f.debug_tuple("Content").field(s).finish(),
+            Self::ToolCall { name, args } => f
+                .debug_struct("ToolCall")
+                .field("name", name)
+                .field("args", args)
+                .finish(),
+            Self::PendingApproval { name, args, .. } => f
+                .debug_struct("PendingApproval")
+                .field("name", name)
+                .field("args", args)
+                .finish(),
+            Self::ToolResult { name, result } => f
+                .debug_struct("ToolResult")
+                .field("name", name)
+                .field("result", result)
+                .finish(),
+            Self::Usage(u) => f.debug_tuple("Usage").field(u).finish(),
+            Self::Finished => write!(f, "Finished"),
+            Self::Error(e) => f.debug_tuple("Error").field(e).finish(),
+        }
+    }
 }
 
 /// Core trait all AI providers implement.

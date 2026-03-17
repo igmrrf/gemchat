@@ -11,6 +11,7 @@ use ratatui::{
 use syntect::{
     easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet, util::LinesWithEndings,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 use tui_textarea::TextArea;
@@ -29,6 +30,9 @@ mod tools;
 mod worktree;
 
 use crate::cli::Cli;
+use crate::pipeline::Pipeline;
+use crate::agents::AgentRole;
+use crate::provider::AiUpdate;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -38,7 +42,6 @@ enum InputMode {
     Editing,
 }
 
-#[derive(Clone)]
 enum Action {
     UserInput(KeyEvent),
     SendMessage(String),
@@ -46,13 +49,22 @@ enum Action {
     AiResponseChunk(String),
     AiResponseError(String),
     AiResponseFinish,
-    UpdateUsage(ai::Usage),
+    UpdateUsage(crate::provider::Usage),
     ToolCall { name: String, args: String },
     ToolResult { name: String, result: String },
+    PendingApproval {
+        name: String,
+        args: String,
+        tx: tokio::sync::oneshot::Sender<bool>,
+    },
+    ApproveTool(bool),
+    ListSessions,
+    LoadSession(String),
     Tick,
     Quit,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
 struct Message {
     role: String,
     content: String,
@@ -74,24 +86,32 @@ struct App<'a> {
     // Stats
     total_prompt_tokens: i32,
     total_response_tokens: i32,
+
+    pipeline: std::sync::Arc<Pipeline>,
+
+    // Approval state
+    pending_approval: Option<(String, String)>,
+    approval_tx: Option<tokio::sync::oneshot::Sender<bool>>,
+
+    // Persistence
+    session_id: String,
+    store: crate::persistence::SessionStore,
 }
 
 impl<'a> App<'a> {
-    fn new(action_tx: mpsc::UnboundedSender<Action>) -> Self {
+    fn new(action_tx: mpsc::UnboundedSender<Action>, pipeline: Pipeline, store: crate::persistence::SessionStore) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_block(Block::default().borders(Borders::ALL).title("Input"));
         textarea.set_placeholder_text("Type message... (Enter to send, Esc to quit)");
+
+        let session_id = uuid::Uuid::new_v4().to_string();
 
         Self {
             textarea,
             messages: vec![
                 Message {
                     role: "System".into(),
-                    content: "Welcome to the AI Chat TUI!".into(),
-                },
-                Message {
-                    role: "System".into(),
-                    content: "Set GEMINI_API_KEY env var for real AI.".into(),
+                    content: "Welcome to GemChat!".into(),
                 },
             ],
             should_quit: false,
@@ -105,6 +125,11 @@ impl<'a> App<'a> {
             ts: ThemeSet::load_defaults(),
             total_prompt_tokens: 0,
             total_response_tokens: 0,
+            pipeline: std::sync::Arc::new(pipeline),
+            pending_approval: None,
+            approval_tx: None,
+            session_id,
+            store,
         }
     }
 
@@ -164,55 +189,90 @@ impl<'a> App<'a> {
                         KeyCode::Char('c') => {
                             self.messages.clear();
                             self.should_auto_scroll = true;
+                            let _ = self.action_tx.send(Action::SendMessage("/clear".into()));
+                        }
+                        KeyCode::Char('y') if self.pending_approval.is_some() => {
+                            let _ = self.action_tx.send(Action::ApproveTool(true));
+                        }
+                        KeyCode::Char('n') if self.pending_approval.is_some() => {
+                            let _ = self.action_tx.send(Action::ApproveTool(false));
                         }
                         _ => {}
                     },
                 }
             }
             Action::SendMessage(text) => {
+                if text == "/sessions" {
+                    let _ = self.action_tx.send(Action::ListSessions);
+                    return Ok(());
+                } else if text.starts_with("/load ") {
+                    let session_id = text.trim_start_matches("/load").trim().to_string();
+                    let _ = self.action_tx.send(Action::LoadSession(session_id));
+                    return Ok(());
+                }
+
                 self.is_loading = true;
                 self.spinner_index = 0;
-
-                // Build a combined prompt from conversation history so the AI has context
-                let mut full_context = String::from(
-                    "System Instructions: You are a helpful AI assistant. Answer the user's prompt based on the history below. If the history contains a 'Tool Result', DO NOT call the same tool again. Read the text provided in the Tool Result and use it to answer the user directly.\n\nConversation History:\n",
-                );
-                for msg in &self.messages {
-                    if !msg.content.is_empty() {
-                        full_context.push_str(&format!("{}: {}\n\n", msg.role, msg.content));
-                    }
-                }
-
-                // If this message is an automated tool result, reinforce the instruction
-                if text.starts_with("Tool") {
-                    full_context.push_str("System: The tool just returned data. Read it carefully and summarize the final answer to the user now. Do NOT output a function call.\n");
-                }
+                self.auto_save();
 
                 let tx = self.action_tx.clone();
+                let pipeline = self.pipeline.clone();
+                
                 tokio::spawn(async move {
                     let (ai_tx, mut ai_rx) = mpsc::unbounded_channel();
 
-                    tokio::spawn(async move {
-                        ai::stream_response(full_context, ai_tx).await;
-                    });
+                    if text.starts_with("/orchestrate") || text.starts_with("/plan") {
+                        let prompt = if text.starts_with("/orchestrate") {
+                            text.trim_start_matches("/orchestrate").trim().to_string()
+                        } else {
+                            text.trim_start_matches("/plan").trim().to_string()
+                        };
+                        
+                        tokio::spawn(async move {
+                            pipeline.orchestrate(&prompt, ai_tx).await;
+                        });
+                    } else if text == "/clear" {
+                        let _ = pipeline.context.write().await.clear();
+                        let _ = ai_tx.send(AiUpdate::Content("🧹 Context cleared.".into()));
+                        let _ = ai_tx.send(AiUpdate::Finished);
+                    } else if text.starts_with("/merge") {
+                        let pipeline_id = text.trim_start_matches("/merge").trim().to_string();
+                        if pipeline_id.is_empty() {
+                            let _ = ai_tx.send(AiUpdate::Error("Usage: /merge <pipeline_id>".into()));
+                        } else {
+                            tokio::spawn(async move {
+                                pipeline.merge_worktree(&pipeline_id, ai_tx).await;
+                            });
+                        }
+                    } else {
+                        tokio::spawn(async move {
+                            pipeline.stream_agent(AgentRole::Coder, &text, &pipeline.working_dir, ai_tx).await;
+                        });
+                    }
 
                     let _ = tx.send(Action::AiResponseStart);
 
                     while let Some(update) = ai_rx.recv().await {
                         match update {
-                            ai::AiUpdate::Content(s) => {
+                            AiUpdate::Content(s) => {
                                 let _ = tx.send(Action::AiResponseChunk(s));
                             }
-                            ai::AiUpdate::Usage(usage) => {
+                            AiUpdate::Usage(usage) => {
                                 let _ = tx.send(Action::UpdateUsage(usage));
                             }
-                            ai::AiUpdate::Error(e) => {
+                            AiUpdate::Error(e) => {
                                 let _ = tx.send(Action::AiResponseError(e));
                             }
-                            ai::AiUpdate::ToolCall { name, args } => {
+                            AiUpdate::ToolCall { name, args } => {
                                 let _ = tx.send(Action::ToolCall { name, args });
                             }
-                            ai::AiUpdate::Finished => {
+                            AiUpdate::PendingApproval { name, args, tx: app_tx } => {
+                                let _ = tx.send(Action::PendingApproval { name, args, tx: app_tx });
+                            }
+                            AiUpdate::ToolResult { name, result } => {
+                                let _ = tx.send(Action::ToolResult { name, result });
+                            }
+                            AiUpdate::Finished => {
                                 let _ = tx.send(Action::AiResponseFinish);
                                 break;
                             }
@@ -239,6 +299,7 @@ impl<'a> App<'a> {
             Action::UpdateUsage(usage) => {
                 self.total_prompt_tokens += usage.prompt_tokens;
                 self.total_response_tokens += usage.response_tokens;
+                self.auto_save();
             }
             Action::AiResponseError(err) => {
                 self.messages.push(Message {
@@ -246,12 +307,14 @@ impl<'a> App<'a> {
                     content: err,
                 });
                 self.is_loading = false;
+                self.auto_save();
             }
             Action::AiResponseFinish => {
                 self.is_loading = false;
+                self.auto_save();
             }
 
-            Action::ToolCall { name, args } => {
+            Action::ToolCall { name, args: _ } => {
                 self.messages.push(Message {
                     role: "System".into(),
                     content: format!("Executing tool: `{}`", name),
@@ -259,12 +322,7 @@ impl<'a> App<'a> {
                 if self.should_auto_scroll {
                     self.scroll_to_bottom();
                 }
-
-                let tx = self.action_tx.clone();
-                tokio::spawn(async move {
-                    let result = tools::execute_tool(&name, &args).await;
-                    let _ = tx.send(Action::ToolResult { name, result });
-                });
+                self.auto_save();
             }
             Action::ToolResult { name, result } => {
                 self.messages.push(Message {
@@ -274,16 +332,98 @@ impl<'a> App<'a> {
                 if self.should_auto_scroll {
                     self.scroll_to_bottom();
                 }
-
-                // Note: To make the AI aware of the result, you can uncomment the next line
-                // once your `ai` module is configured to process tool responses:
-                let _ = self.action_tx.send(Action::SendMessage(format!(
-                    "Tool {} output:\n{}",
-                    name, result
-                )));
+                self.auto_save();
+            }
+            Action::PendingApproval { name, args, tx } => {
+                self.pending_approval = Some((name, args));
+                self.auto_save();
+                self.approval_tx = Some(tx);
+            }
+            Action::ApproveTool(approved) => {
+                if let Some(tx) = self.approval_tx.take() {
+                    let _ = tx.send(approved);
+                }
+                self.pending_approval = None;
+                self.auto_save();
+            }
+            Action::ListSessions => {
+                match self.store.load_active_pipelines() {
+                    Ok(records) => {
+                        let mut msg = String::from("### Recent Sessions\n\n");
+                        if records.is_empty() {
+                            msg.push_str("No active sessions found.\n");
+                        } else {
+                            for r in records.iter().take(10) {
+                                msg.push_str(&format!("- **{}** ({}): {} tokens\n", r.id, r.updated_at.format("%Y-%m-%d %H:%M"), r.total_tokens));
+                            }
+                            msg.push_str("\n*Use `/load <id>` to resume a session.*");
+                        }
+                        self.messages.push(Message {
+                            role: "System".into(),
+                            content: msg,
+                        });
+                        if self.should_auto_scroll {
+                            self.scroll_to_bottom();
+                        }
+                    }
+                    Err(e) => {
+                        self.messages.push(Message {
+                            role: "Error".into(),
+                            content: format!("Failed to list sessions: {}", e),
+                        });
+                    }
+                }
+            }
+            Action::LoadSession(id) => {
+                match self.store.load_pipeline(&id) {
+                    Ok(record) => {
+                        self.session_id = record.id.clone();
+                        let mut loaded_msgs = Vec::new();
+                        for val in record.messages {
+                            if let Ok(msg) = serde_json::from_value(val) {
+                                loaded_msgs.push(msg);
+                            }
+                        }
+                        self.messages = loaded_msgs;
+                        self.messages.push(Message {
+                            role: "System".into(),
+                            content: format!("✅ Session {} loaded successfully.", id),
+                        });
+                        if self.should_auto_scroll {
+                            self.scroll_to_bottom();
+                        }
+                    }
+                    Err(e) => {
+                        self.messages.push(Message {
+                            role: "Error".into(),
+                            content: format!("Failed to load session '{}': {}", id, e),
+                        });
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+
+    fn auto_save(&self) {
+        let mut record = crate::persistence::store::PipelineRecord::new(
+            self.session_id.clone(),
+            "GemChat Session".into(),
+            self.pipeline.working_dir.to_string_lossy().to_string(),
+        );
+
+        record.total_tokens = (self.total_prompt_tokens + self.total_response_tokens) as i64;
+        record.messages = self
+            .messages
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+
+        // Capture context snapshot if possible
+        // Since it's async, we might skip it or use a simplified approach
+        
+        let _ = self.store.save_pipeline(&record);
     }
 
     fn scroll_up(&mut self) {
@@ -466,12 +606,28 @@ impl<'a> App<'a> {
         };
 
         let mut textarea = self.textarea.clone();
+        let title = if let Some((name, _)) = &self.pending_approval {
+            format!("Tool Approval: {} (y/n)", name)
+        } else {
+            "Input".to_string()
+        };
+
+        let block_style = if self.pending_approval.is_some() {
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+        } else {
+            input_block_style
+        };
+
         textarea.set_block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Input")
-                .style(input_block_style),
+                .title(title)
+                .style(block_style),
         );
+
+        if let Some((name, args)) = &self.pending_approval {
+             textarea.set_placeholder_text(format!("Approve tool '{}' with args '{}'? (y)es / (n)o", name, args));
+        }
 
         frame.render_widget(&textarea, layout[1]);
     }
@@ -616,7 +772,15 @@ async fn main() -> Result<()> {
 
 async fn run(mut terminal: DefaultTerminal) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut app = App::new(tx.clone());
+    
+    // Initialize pipeline
+    let config = crate::config::load_config()?;
+    let model = crate::config::model_for_role(&config, "coder");
+    let working_dir = std::env::current_dir()?;
+    let store = crate::persistence::SessionStore::new(config.general.persistence_ttl_hours)?;
+    let pipeline = Pipeline::new(config, &model, working_dir)?;
+    
+    let mut app = App::new(tx.clone(), pipeline, store);
 
     // Tick task
     let tick_tx = tx.clone();

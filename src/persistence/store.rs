@@ -21,6 +21,7 @@ pub struct PipelineRecord {
     pub current_step: Option<String>,
     pub context_snapshot: HashMap<String, String>,
     pub total_tokens: i64,
+    pub messages: Vec<serde_json::Value>, // Generic JSON to avoid circular dependency
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -192,6 +193,7 @@ impl PipelineRecord {
             current_step: None,
             context_snapshot: HashMap::new(),
             total_tokens: 0,
+            messages: Vec::new(),
         }
     }
 
