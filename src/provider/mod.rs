@@ -4,7 +4,7 @@ pub mod openai;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 use crate::config::AppConfig;
 
@@ -97,7 +97,7 @@ pub trait AiProvider: Send + Sync {
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
-        tx: UnboundedSender<AiUpdate>,
+        tx: Sender<AiUpdate>,
     );
 
     /// The model identifier (e.g. "gemini-2.5-flash")

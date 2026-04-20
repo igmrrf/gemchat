@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 use super::{AiProvider, AiUpdate, ChatMessage, ToolDefinition, Usage};
 
@@ -66,29 +66,28 @@ impl ClaudeProvider {
     }
 
     /// Parse an SSE event from the Claude streaming API.
-    fn parse_sse_event(event_type: &str, data: &str, tx: &UnboundedSender<AiUpdate>) {
+    async fn parse_sse_event(event_type: &str, data: &str, tx: &Sender<AiUpdate>) {
         match event_type {
             "content_block_delta" => {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                    if let Some(delta) = json.get("delta") {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
+                    && let Some(delta) = json.get("delta") {
                         // Text delta
                         if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                            let _ = tx.send(AiUpdate::Content(text.to_string()));
+                            let _ = tx.send(AiUpdate::Content(text.to_string())).await;
                         }
                         // Tool use input delta (partial JSON)
                         if let Some(partial) =
                             delta.get("partial_json").and_then(|p| p.as_str())
                         {
                             // Accumulate — will be assembled by the pipeline
-                            let _ = tx.send(AiUpdate::Content(partial.to_string()));
+                            let _ = tx.send(AiUpdate::Content(partial.to_string())).await;
                         }
                     }
-                }
             }
             "content_block_start" => {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                    if let Some(content_block) = json.get("content_block") {
-                        if content_block.get("type").and_then(|t| t.as_str())
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
+                    && let Some(content_block) = json.get("content_block")
+                        && content_block.get("type").and_then(|t| t.as_str())
                             == Some("tool_use")
                         {
                             // Tool call starting — extract name
@@ -99,11 +98,9 @@ impl ClaudeProvider {
                                 let _ = tx.send(AiUpdate::ToolCall {
                                     name: name.to_string(),
                                     args: String::new(), // Filled via delta accumulation
-                                });
+                                }).await;
                             }
                         }
-                    }
-                }
             }
             "message_delta" => {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
@@ -116,14 +113,14 @@ impl ClaudeProvider {
                             prompt_tokens: 0,
                             response_tokens: output_tokens,
                             total_tokens: output_tokens,
-                        }));
+                        })).await;
                     }
                 }
             }
             "message_start" => {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                    if let Some(message) = json.get("message") {
-                        if let Some(usage) = message.get("usage") {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
+                    && let Some(message) = json.get("message")
+                        && let Some(usage) = message.get("usage") {
                             let input_tokens = usage
                                 .get("input_tokens")
                                 .and_then(|t| t.as_i64())
@@ -132,13 +129,11 @@ impl ClaudeProvider {
                                 prompt_tokens: input_tokens,
                                 response_tokens: 0,
                                 total_tokens: input_tokens,
-                            }));
+                            })).await;
                         }
-                    }
-                }
             }
             "message_stop" => {
-                let _ = tx.send(AiUpdate::Finished);
+                let _ = tx.send(AiUpdate::Finished).await;
             }
             _ => {}
         }
@@ -151,20 +146,20 @@ impl AiProvider for ClaudeProvider {
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
-        tx: UnboundedSender<AiUpdate>,
+        tx: Sender<AiUpdate>,
     ) {
         if self.api_key.is_empty() {
             // Mock mode
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let _ = tx.send(AiUpdate::Content(
                 "(Mock Claude) Set ANTHROPIC_API_KEY for real responses.\n".into(),
-            ));
+            )).await;
             let _ = tx.send(AiUpdate::Usage(Usage {
                 prompt_tokens: 10,
                 response_tokens: 20,
                 total_tokens: 30,
-            }));
-            let _ = tx.send(AiUpdate::Finished);
+            })).await;
+            let _ = tx.send(AiUpdate::Finished).await;
             return;
         }
 
@@ -183,8 +178,8 @@ impl AiProvider for ClaudeProvider {
         {
             Ok(r) => r,
             Err(e) => {
-                let _ = tx.send(AiUpdate::Error(format!("Request failed: {}", e)));
-                let _ = tx.send(AiUpdate::Finished);
+                let _ = tx.send(AiUpdate::Error(format!("Request failed: {}", e))).await;
+                let _ = tx.send(AiUpdate::Finished).await;
                 return;
             }
         };
@@ -192,8 +187,8 @@ impl AiProvider for ClaudeProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_else(|_| "unknown".into());
-            let _ = tx.send(AiUpdate::Error(format!("API Error {}: {}", status, text)));
-            let _ = tx.send(AiUpdate::Finished);
+            let _ = tx.send(AiUpdate::Error(format!("API Error {}: {}", status, text))).await;
+            let _ = tx.send(AiUpdate::Finished).await;
             return;
         }
 
@@ -206,7 +201,7 @@ impl AiProvider for ClaudeProvider {
             let chunk = match item {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(AiUpdate::Error(format!("Stream error: {}", e)));
+                    let _ = tx.send(AiUpdate::Error(format!("Stream error: {}", e))).await;
                     break;
                 }
             };
@@ -223,9 +218,8 @@ impl AiProvider for ClaudeProvider {
 
                 if line.starts_with("event: ") {
                     current_event = line[7..].to_string();
-                } else if line.starts_with("data: ") {
-                    let data = &line[6..];
-                    Self::parse_sse_event(&current_event, data, &tx);
+                } else if let Some(data) = line.strip_prefix("data: ") {
+                    Self::parse_sse_event(&current_event, data, &tx).await;
                 }
                 // Empty lines separate events — reset
                 if line.is_empty() {
@@ -234,7 +228,7 @@ impl AiProvider for ClaudeProvider {
             }
         }
 
-        let _ = tx.send(AiUpdate::Finished);
+        let _ = tx.send(AiUpdate::Finished).await;
     }
 
     fn model_name(&self) -> &str {

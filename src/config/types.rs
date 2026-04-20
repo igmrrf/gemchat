@@ -4,6 +4,7 @@ use std::collections::HashMap;
 /// Root configuration structure for gemchat.
 /// Loaded from `~/.config/gemchat/config.toml` with sensible defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct AppConfig {
     #[serde(default)]
     pub general: GeneralConfig,
@@ -76,6 +77,7 @@ pub struct ProvidersConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct ProviderEntry {
     #[serde(default)]
     pub api_key_env: String,
@@ -121,17 +123,6 @@ fn default_dangerous_tools() -> Vec<String> {
 
 // ── Trait impls ──
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            approval: ApprovalConfig::default(),
-            models: ModelConfig::default(),
-            providers: ProvidersConfig::default(),
-            qa: QaConfig::default(),
-        }
-    }
-}
 
 impl Default for GeneralConfig {
     fn default() -> Self {
@@ -187,14 +178,6 @@ impl Default for ProvidersConfig {
     }
 }
 
-impl Default for ProviderEntry {
-    fn default() -> Self {
-        Self {
-            api_key_env: String::new(),
-            extra: HashMap::new(),
-        }
-    }
-}
 
 impl Default for QaConfig {
     fn default() -> Self {

@@ -6,8 +6,32 @@ pub mod planner;
 pub mod qa;
 pub mod researcher;
 pub mod reviewer;
+pub mod skill;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use std::path::PathBuf;
+
+use crate::provider::AiUpdate;
+use crate::pipeline::step::StepResult;
+
+/// Shared trait for all agents in the system.
+#[async_trait]
+pub trait Agent: Send + Sync {
+    /// The role of this agent.
+    fn role(&self) -> AgentRole;
+
+    /// Process a task given a user message and an optional working directory.
+    /// Streams updates through `tx_out` and returns the final `StepResult`.
+    async fn process(
+        &self,
+        pipeline: &crate::pipeline::Pipeline,
+        user_message: &str,
+        working_dir: Option<PathBuf>,
+        tx_out: mpsc::Sender<AiUpdate>,
+    ) -> StepResult;
+}
 
 /// Unique agent roles in the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -54,6 +78,15 @@ impl AgentRole {
             Self::Executor => &[
                 "run_command", "git_commit", "git_branch", "git_diff", "git_status",
             ],
+        }
+    }
+
+    /// Default skills for this role.
+    pub fn default_skills(&self) -> Vec<String> {
+        match self {
+            Self::Coder => vec!["rust_expert".into()],
+            Self::Qa => vec!["tdd".into()],
+            _ => vec![],
         }
     }
 

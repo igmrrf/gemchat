@@ -35,6 +35,7 @@ vt100 = "0.15.2"
 portable-pty = "0.9.0"
 uuid = { version = "1", features = ["v4"] }
 unicode-width = "0.2.2"
+libc = "0.2.185"
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -1,7 +1,13 @@
 use std::sync::{Arc, Mutex};
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem, MasterPty, Child};
+use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem, Child};
 use tui_term::vt100::Parser;
 use std::io::{Read, Write};
+
+impl Drop for EmbeddedTerminal {
+    fn drop(&mut self) {
+        let _ = self.kill();
+    }
+}
 
 pub struct EmbeddedTerminal {
     pub writer: Mutex<Box<dyn Write + Send>>,
@@ -53,6 +59,11 @@ impl EmbeddedTerminal {
         let mut writer = self.writer.lock().unwrap();
         writer.write_all(data)?;
         writer.flush()?;
+        Ok(())
+    }
+
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()?;
         Ok(())
     }
 

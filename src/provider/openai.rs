@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 use super::{AiProvider, AiUpdate, ChatMessage, ToolDefinition, Usage};
 
@@ -85,7 +85,7 @@ impl OpenAiProvider {
     }
 
     /// Parse an SSE data line from the OpenAI streaming API.
-    fn parse_sse_line(line: &str, tx: &UnboundedSender<AiUpdate>) {
+    async fn parse_sse_line(line: &str, tx: &Sender<AiUpdate>) {
         if !line.starts_with("data: ") {
             return;
         }
@@ -94,7 +94,7 @@ impl OpenAiProvider {
 
         // [DONE] signals end of stream
         if json_str.trim() == "[DONE]" {
-            let _ = tx.send(AiUpdate::Finished);
+            let _ = tx.send(AiUpdate::Finished).await;
             return;
         }
 
@@ -103,35 +103,32 @@ impl OpenAiProvider {
         };
 
         // Extract from choices[0].delta
-        if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
-            if let Some(first) = choices.first() {
-                if let Some(delta) = first.get("delta") {
-                    // Content text
-                    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                        let _ = tx.send(AiUpdate::Content(content.to_string()));
-                    }
+        if let Some(choices) = json.get("choices").and_then(|c| c.as_array())
+            && let Some(first) = choices.first()
+            && let Some(delta) = first.get("delta")
+        {
+            // Content text
+            if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                let _ = tx.send(AiUpdate::Content(content.to_string())).await;
+            }
 
-                    // Tool calls
-                    if let Some(tool_calls) =
-                        delta.get("tool_calls").and_then(|tc| tc.as_array())
-                    {
-                        for tc in tool_calls {
-                            if let Some(function) = tc.get("function") {
-                                let name = function
-                                    .get("name")
-                                    .and_then(|n| n.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let args = function
-                                    .get("arguments")
-                                    .and_then(|a| a.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
+            // Tool calls
+            if let Some(tool_calls) = delta.get("tool_calls").and_then(|tc| tc.as_array()) {
+                for tc in tool_calls {
+                    if let Some(function) = tc.get("function") {
+                        let name = function
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let args = function
+                            .get("arguments")
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("")
+                            .to_string();
 
-                                if !name.is_empty() {
-                                    let _ = tx.send(AiUpdate::ToolCall { name, args });
-                                }
-                            }
+                        if !name.is_empty() {
+                            let _ = tx.send(AiUpdate::ToolCall { name, args }).await;
                         }
                     }
                 }
@@ -140,19 +137,25 @@ impl OpenAiProvider {
 
         // Extract usage (only in the final chunk with stream_options)
         if let Some(usage) = json.get("usage") {
-            let prompt_tokens =
-                usage.get("prompt_tokens").and_then(|t| t.as_i64()).unwrap_or(0) as i32;
+            let prompt_tokens = usage
+                .get("prompt_tokens")
+                .and_then(|t| t.as_i64())
+                .unwrap_or(0) as i32;
             let completion_tokens = usage
                 .get("completion_tokens")
                 .and_then(|t| t.as_i64())
                 .unwrap_or(0) as i32;
-            let total_tokens =
-                usage.get("total_tokens").and_then(|t| t.as_i64()).unwrap_or(0) as i32;
-            let _ = tx.send(AiUpdate::Usage(Usage {
-                prompt_tokens,
-                response_tokens: completion_tokens,
-                total_tokens,
-            }));
+            let total_tokens = usage
+                .get("total_tokens")
+                .and_then(|t| t.as_i64())
+                .unwrap_or(0) as i32;
+            let _ = tx
+                .send(AiUpdate::Usage(Usage {
+                    prompt_tokens,
+                    response_tokens: completion_tokens,
+                    total_tokens,
+                }))
+                .await;
         }
     }
 }
@@ -163,20 +166,24 @@ impl AiProvider for OpenAiProvider {
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
-        tx: UnboundedSender<AiUpdate>,
+        tx: Sender<AiUpdate>,
     ) {
         if self.api_key.is_empty() {
             // Mock mode
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let _ = tx.send(AiUpdate::Content(
-                "(Mock OpenAI) Set OPENAI_API_KEY for real responses.\n".into(),
-            ));
-            let _ = tx.send(AiUpdate::Usage(Usage {
-                prompt_tokens: 10,
-                response_tokens: 20,
-                total_tokens: 30,
-            }));
-            let _ = tx.send(AiUpdate::Finished);
+            let _ = tx
+                .send(AiUpdate::Content(
+                    "(Mock OpenAI) Set OPENAI_API_KEY for real responses.\n".into(),
+                ))
+                .await;
+            let _ = tx
+                .send(AiUpdate::Usage(Usage {
+                    prompt_tokens: 10,
+                    response_tokens: 20,
+                    total_tokens: 30,
+                }))
+                .await;
+            let _ = tx.send(AiUpdate::Finished).await;
             return;
         }
 
@@ -194,8 +201,8 @@ impl AiProvider for OpenAiProvider {
         {
             Ok(r) => r,
             Err(e) => {
-                let _ = tx.send(AiUpdate::Error(format!("Request failed: {}", e)));
-                let _ = tx.send(AiUpdate::Finished);
+                let _ = tx.send(AiUpdate::Error(format!("Request failed: {}", e))).await;
+                let _ = tx.send(AiUpdate::Finished).await;
                 return;
             }
         };
@@ -203,8 +210,10 @@ impl AiProvider for OpenAiProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_else(|_| "unknown".into());
-            let _ = tx.send(AiUpdate::Error(format!("API Error {}: {}", status, text)));
-            let _ = tx.send(AiUpdate::Finished);
+            let _ = tx
+                .send(AiUpdate::Error(format!("API Error {}: {}", status, text)))
+                .await;
+            let _ = tx.send(AiUpdate::Finished).await;
             return;
         }
 
@@ -216,7 +225,9 @@ impl AiProvider for OpenAiProvider {
             let chunk = match item {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(AiUpdate::Error(format!("Stream error: {}", e)));
+                    let _ = tx
+                        .send(AiUpdate::Error(format!("Stream error: {}", e)))
+                        .await;
                     break;
                 }
             };
@@ -231,11 +242,11 @@ impl AiProvider for OpenAiProvider {
                     line.pop();
                 }
 
-                Self::parse_sse_line(&line, &tx);
+                Self::parse_sse_line(&line, &tx).await;
             }
         }
 
-        let _ = tx.send(AiUpdate::Finished);
+        let _ = tx.send(AiUpdate::Finished).await;
     }
 
     fn model_name(&self) -> &str {

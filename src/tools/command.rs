@@ -36,15 +36,31 @@ impl Tool for RunCommand {
             return "Error: 'command' is required".into();
         };
 
-        let output_task = Command::new("sh")
+        // Security: Basic blacklist/whitelist check
+        if let Err(e) = validate_command(&cmd) {
+            return format!("Security Error: {}", e);
+        }
+
+        let mut command = Command::new("sh");
+        command
             .arg("-c")
             .arg(&cmd)
             .current_dir(working_dir)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+            .stderr(Stdio::piped());
 
-        let mut child = match output_task {
+        // Create a process group to ensure we can kill child processes of the shell
+        #[cfg(unix)]
+        {
+            unsafe {
+                command.pre_exec(|| {
+                    let _ = libc::setpgid(0, 0);
+                    Ok(())
+                });
+            }
+        }
+
+        let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) => return format!("Failed to spawn command: {}", e),
         };
@@ -71,8 +87,33 @@ impl Tool for RunCommand {
             }
             Ok(Err(e)) => format!("Command execution failed: {}", e),
             Err(_) => {
+                kill_process_group(&child);
                 let _ = child.kill().await;
                 "Error: Command timed out after 30s. If this command is interactive (requires input/selection), please run it with 'interactive: true'.".to_string()
+            }
+        }
+    }
+}
+
+fn validate_command(cmd: &str) -> Result<(), String> {
+    let blacklisted = ["rm -rf /", "mkfs", "dd ", ":(){ :|:& };:"];
+    for b in blacklisted {
+        if cmd.contains(b) {
+            return Err(format!("Command contains blacklisted sequence: '{}'", b));
+        }
+    }
+
+    // Allow list for dangerous shell builtins or specific tools
+    // This can be expanded based on user needs
+    Ok(())
+}
+
+fn kill_process_group(child: &tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
             }
         }
     }

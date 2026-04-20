@@ -151,6 +151,19 @@ impl ToolRegistry {
             })
             .collect()
     }
+
+    /// Get tool definitions filtered to only allowed tool names (Vec version).
+    pub fn tool_definitions_for_vec(&self, allowed: &[String]) -> Vec<crate::provider::ToolDefinition> {
+        self.tools
+            .values()
+            .filter(|t| allowed.contains(&t.name().to_string()))
+            .map(|tool| crate::provider::ToolDefinition {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: tool.parameters(),
+            })
+            .collect()
+    }
 }
 
 impl Default for ToolRegistry {

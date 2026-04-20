@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
 use std::env;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 #[derive(Debug, Clone)]
 pub struct Usage {
@@ -20,31 +20,31 @@ pub enum AiUpdate {
     Usage(Usage),
 }
 
-pub async fn stream_response(input: String, tx: UnboundedSender<AiUpdate>) {
+pub async fn stream_response(input: String, tx: Sender<AiUpdate>) {
     if let Ok(key) = env::var("GEMINI_API_KEY") {
         if let Err(e) = stream_gemini(&key, &input, tx.clone()).await {
-            let _ = tx.send(AiUpdate::Error(format!("Error: {}", e)));
+            let _ = tx.send(AiUpdate::Error(format!("Error: {}", e))).await;
         }
     } else {
         // Fallback/Mock
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let _ = tx.send(AiUpdate::Content("(Mock AI): ".to_string()));
+        let _ = tx.send(AiUpdate::Content("(Mock AI): ".to_string())).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let _ = tx.send(AiUpdate::Content(format!("I received: '{}'.\n", input)));
+        let _ = tx.send(AiUpdate::Content(format!("I received: '{}'.\n", input))).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let _ = tx.send(AiUpdate::Content(
             "Set GEMINI_API_KEY for real responses.".to_string(),
-        ));
+        )).await;
         let _ = tx.send(AiUpdate::Usage(Usage {
             prompt_tokens: 10,
             response_tokens: 20,
             total_tokens: 30,
-        }));
+        })).await;
     }
-    let _ = tx.send(AiUpdate::Finished);
+    let _ = tx.send(AiUpdate::Finished).await;
 }
 
-async fn stream_gemini(api_key: &str, prompt: &str, tx: UnboundedSender<AiUpdate>) -> Result<()> {
+async fn stream_gemini(api_key: &str, prompt: &str, tx: Sender<AiUpdate>) -> Result<()> {
     let client = Client::new();
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:streamGenerateContent?key={}&alt=sse",
@@ -162,15 +162,14 @@ async fn stream_gemini(api_key: &str, prompt: &str, tx: UnboundedSender<AiUpdate
                 line.pop();
             }
 
-            if line.starts_with("data: ") {
-                let json_str = &line[6..];
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
+            if let Some(json_str) = line.strip_prefix("data: ")
+                && let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
                     // Extract Content
-                    if let Some(candidates) = json.get("candidates") {
-                        if let Some(first) = candidates.get(0) {
-                            if let Some(content) = first.get("content") {
-                                if let Some(parts) = content.get("parts") {
-                                    if let Some(parts_array) = parts.as_array() {
+                    if let Some(candidates) = json.get("candidates")
+                        && let Some(first) = candidates.get(0)
+                            && let Some(content) = first.get("content")
+                                && let Some(parts) = content.get("parts")
+                                    && let Some(parts_array) = parts.as_array() {
                                         for part in parts_array {
                                             // 1. Check for text chunks
                                             if let Some(text_chunk) =
@@ -178,11 +177,11 @@ async fn stream_gemini(api_key: &str, prompt: &str, tx: UnboundedSender<AiUpdate
                                             {
                                                 let _ = tx.send(AiUpdate::Content(
                                                     text_chunk.to_string(),
-                                                ));
+                                                )).await;
                                             }
                                             // 2. Check for tool calls
-                                            if let Some(func_call) = part.get("functionCall") {
-                                                if let Some(name) =
+                                            if let Some(func_call) = part.get("functionCall")
+                                                && let Some(name) =
                                                     func_call.get("name").and_then(|n| n.as_str())
                                                 {
                                                     let args = func_call
@@ -192,15 +191,10 @@ async fn stream_gemini(api_key: &str, prompt: &str, tx: UnboundedSender<AiUpdate
                                                     let _ = tx.send(AiUpdate::ToolCall {
                                                         name: name.to_string(),
                                                         args,
-                                                    });
+                                                    }).await;
                                                 }
-                                            }
                                         }
                                     }
-                                }
-                            }
-                        }
-                    }
                     // Extract Usage Metadata
                     if let Some(usage) = json.get("usageMetadata") {
                         let prompt_tokens = usage["promptTokenCount"].as_i64().unwrap_or(0) as i32;
@@ -212,10 +206,9 @@ async fn stream_gemini(api_key: &str, prompt: &str, tx: UnboundedSender<AiUpdate
                             prompt_tokens,
                             response_tokens,
                             total_tokens,
-                        }));
+                        })).await;
                     }
                 }
-            }
         }
     }
 

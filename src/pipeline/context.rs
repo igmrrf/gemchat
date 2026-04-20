@@ -44,6 +44,11 @@ impl PipelineContext {
         self.outputs.get(agent).map(|s| s.as_str())
     }
 
+    /// Get all agent outputs as a HashMap.
+    pub fn get_all_outputs(&self) -> HashMap<String, String> {
+        self.outputs.clone()
+    }
+
     /// Get the N most recent outputs (agent_name, output).
     pub fn recent_outputs(&self, n: usize) -> Vec<(&str, &str)> {
         self.history
@@ -59,6 +64,16 @@ impl PipelineContext {
         self.outputs.clear();
         self.history.clear();
         self.full_history.clear();
+    }
+
+    /// Prune history by keeping only the last N messages and potentially a summary of the rest.
+    /// This is a stub for the actual AI summarization logic that will be called from Pipeline.
+    pub fn prune_history(&mut self, keep_last: usize) -> Vec<ChatMessage> {
+        if self.full_history.len() <= keep_last {
+            return Vec::new();
+        }
+        let split_at = self.full_history.len() - keep_last;
+        self.full_history.drain(0..split_at).collect()
     }
 }
 

@@ -1,11 +1,12 @@
 pub mod context;
 pub mod step;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use tokio::sync::{mpsc, RwLock};
 
-use crate::agents::AgentRole;
+use crate::agents::{AgentRole, Agent, skill::SkillRegistry};
 use crate::config::AppConfig;
 use crate::provider::{self, AiProvider, AiUpdate, ChatMessage};
 use crate::tools::ToolRegistry;
@@ -21,6 +22,8 @@ pub struct Pipeline {
     pub config: AppConfig,
     pub context: RwLock<PipelineContext>,
     pub tool_registry: ToolRegistry,
+    pub skill_registry: SkillRegistry,
+    pub agents: HashMap<AgentRole, Box<dyn Agent>>,
     pub working_dir: PathBuf,
     pub worktree_manager: RwLock<WorktreeManager>,
     provider: Box<dyn AiProvider>,
@@ -31,10 +34,23 @@ impl Pipeline {
     pub fn new(config: AppConfig, model: &str, working_dir: PathBuf) -> color_eyre::Result<Self> {
         let provider = provider::create_provider(model, &config)?;
         let worktree_manager = WorktreeManager::new(working_dir.clone());
+
+        let mut agents: HashMap<AgentRole, Box<dyn Agent>> = HashMap::new();
+        agents.insert(AgentRole::Planner, Box::new(crate::agents::planner::PlannerAgent));
+        agents.insert(AgentRole::Coder, Box::new(crate::agents::coder::CoderAgent));
+        agents.insert(AgentRole::Orchestrator, Box::new(crate::agents::orchestrator::OrchestratorAgent));
+        agents.insert(AgentRole::Architect, Box::new(crate::agents::architect::ArchitectAgent));
+        agents.insert(AgentRole::Researcher, Box::new(crate::agents::researcher::ResearcherAgent));
+        agents.insert(AgentRole::Reviewer, Box::new(crate::agents::reviewer::ReviewerAgent));
+        agents.insert(AgentRole::Qa, Box::new(crate::agents::qa::QaAgent));
+        agents.insert(AgentRole::Executor, Box::new(crate::agents::executor::ExecutorAgent));
+
         Ok(Self {
             config,
             context: RwLock::new(PipelineContext::new()),
             tool_registry: ToolRegistry::new(),
+            skill_registry: SkillRegistry::new(),
+            agents,
             working_dir,
             worktree_manager: RwLock::new(worktree_manager),
             provider,
@@ -52,12 +68,26 @@ impl Pipeline {
         &self,
         role: AgentRole,
         user_message: &str,
-        working_dir: &PathBuf,
-        tx_out: mpsc::UnboundedSender<AiUpdate>,
+        working_dir: &std::path::Path,
+        tx_out: mpsc::Sender<AiUpdate>,
     ) {
-        let system_prompt = role.system_prompt();
-        let allowed_tools = role.allowed_tools();
-        let tools = self.tool_registry.tool_definitions_for(allowed_tools);
+        let mut system_prompt = role.system_prompt().to_string();
+        let mut allowed_tools: Vec<String> = role.allowed_tools().iter().map(|s| s.to_string()).collect();
+
+        // Apply default skills for the role
+        for skill_name in role.default_skills() {
+            if let Some(skill) = self.skill_registry.get(&skill_name) {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&format!("[Skill: {}]\n{}", skill.name(), skill.instructions()));
+                for tool in skill.provided_tools() {
+                    if !allowed_tools.contains(&tool) {
+                        allowed_tools.push(tool);
+                    }
+                }
+            }
+        }
+
+        let tools = self.tool_registry.tool_definitions_for_vec(&allowed_tools);
 
         // Retrieve existing history from context
         let mut messages = self.context.read().await.get_messages();
@@ -88,9 +118,28 @@ impl Pipeline {
             });
         }
 
+        // Automatic history summarization if too long
+        if messages.len() > 20 {
+            let _ = tx_out.send(AiUpdate::Content("📝 Summarizing long context...\n".into())).await;
+            if let Ok(summary) = self.summarize_history(&messages).await {
+                let mut ctx = self.context.write().await;
+                ctx.clear(); // Clear all and replace with summary
+                ctx.add_message(ChatMessage {
+                    role: "system".into(),
+                    content: format!("Summary of previous context: {}", summary),
+                });
+                // Re-fetch messages after summarization
+                messages = ctx.get_messages();
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: user_message.to_string(),
+                });
+            }
+        }
+
         let max_iterations = 10;
         for _iteration in 0..max_iterations {
-            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = mpsc::channel(10);
             self.provider.stream_response(&messages, &tools, tx).await;
 
             let mut chunk_text = String::new();
@@ -100,16 +149,16 @@ impl Pipeline {
                 match update {
                     AiUpdate::Content(text) => {
                         chunk_text.push_str(&text);
-                        let _ = tx_out.send(AiUpdate::Content(text));
+                        let _ = tx_out.send(AiUpdate::Content(text)).await;
                     }
                     AiUpdate::ToolCall { name, args } => {
                         pending_tool_call = Some((name, args));
                     }
                     AiUpdate::Usage(u) => {
-                        let _ = tx_out.send(AiUpdate::Usage(u));
+                        let _ = tx_out.send(AiUpdate::Usage(u)).await;
                     }
                     AiUpdate::Error(e) => {
-                        let _ = tx_out.send(AiUpdate::Error(e));
+                        let _ = tx_out.send(AiUpdate::Error(e)).await;
                         return;
                     }
                     AiUpdate::Finished => break,
@@ -123,7 +172,7 @@ impl Pipeline {
                 let _ = tx_out.send(AiUpdate::ToolCall {
                     name: tool_name.clone(),
                     args: tool_args.clone(),
-                });
+                }).await;
 
                 let needs_approval = self
                     .tool_registry
@@ -135,7 +184,7 @@ impl Pipeline {
                         name: tool_name.clone(),
                         args: tool_args.clone(),
                         tx: app_tx,
-                    });
+                    }).await;
 
                     // Wait for user approval
                     match app_rx.await {
@@ -151,7 +200,7 @@ impl Pipeline {
                             let _ = tx_out.send(AiUpdate::ToolResult {
                                 name: tool_name.clone(),
                                 result: result.clone(),
-                            });
+                            }).await;
                             
                             // Append to local messages for loop iteration
                             messages.push(ChatMessage {
@@ -173,7 +222,7 @@ impl Pipeline {
                         name: tool_name.clone(),
                         args: tool_args.clone(),
                         tx: in_tx,
-                    });
+                    }).await;
                     in_rx.await.unwrap_or_else(|_| "Error: Interactive input failed".into())
                 } else {
                     self.tool_registry
@@ -185,7 +234,7 @@ impl Pipeline {
                 let _ = tx_out.send(AiUpdate::ToolResult {
                     name: tool_name.clone(),
                     result: result.clone(),
-                });
+                }).await;
 
                 // Append to local messages for loop iteration
                 messages.push(ChatMessage {
@@ -214,7 +263,30 @@ impl Pipeline {
             }
             break;
         }
-        let _ = tx_out.send(AiUpdate::Finished);
+        let _ = tx_out.send(AiUpdate::Finished).await;
+    }
+
+    /// Internal helper to summarize chat history when it gets too long.
+    async fn summarize_history(&self, messages: &[ChatMessage]) -> color_eyre::Result<String> {
+        let (tx, mut rx) = mpsc::channel(10);
+        let summary_prompt = vec![ChatMessage {
+            role: "user".into(),
+            content: format!(
+                "Summarize the following chat history concisely, preserving key technical decisions, \
+                file paths, and tool results:\n\n{:?}",
+                messages
+            ),
+        }];
+
+        self.provider.stream_response(&summary_prompt, &[], tx).await;
+
+        let mut summary = String::new();
+        while let Some(update) = rx.recv().await {
+            if let AiUpdate::Content(c) = update {
+                summary.push_str(&c);
+            }
+        }
+        Ok(summary)
     }
 
     /// Execute a single agent step: send messages to the AI, handle tool calls
@@ -225,36 +297,59 @@ impl Pipeline {
         user_message: &str,
         working_dir: Option<PathBuf>,
     ) -> StepResult {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut _rx) = mpsc::channel::<AiUpdate>(100);
+        self.execute_agent_with_streaming(role, user_message, working_dir, tx).await
+    }
+
+    /// Combined execution and streaming for agents.
+    pub async fn execute_agent_with_streaming(
+        &self,
+        role: AgentRole,
+        user_message: &str,
+        working_dir: Option<PathBuf>,
+        tx_out: mpsc::Sender<AiUpdate>,
+    ) -> StepResult {
+        let (tx, mut rx) = mpsc::channel::<AiUpdate>(100);
         let role_clone = role;
         let dir = working_dir.unwrap_or_else(|| self.working_dir.clone());
         
-        let handle = tokio::spawn(async move {
+        let tx_out_clone = tx_out.clone();
+        let handle: tokio::task::JoinHandle<Result<(String, Vec<step::ToolCallRecord>, Option<crate::provider::Usage>), String>> = tokio::spawn(async move {
             let mut inner_output = String::new();
             let mut inner_tool_calls = Vec::new();
             let mut inner_usage = None;
             let mut last_tool_call: Option<(String, String)> = None;
 
             while let Some(update) = rx.recv().await {
-                match update {
-                    AiUpdate::Content(c) => inner_output.push_str(&c),
+                let mut should_break = false;
+                match &update {
+                    AiUpdate::Content(c) => inner_output.push_str(c),
                     AiUpdate::ToolCall { name, args } => {
-                        last_tool_call = Some((name, args));
+                        last_tool_call = Some((name.clone(), args.clone()));
                     }
-                    AiUpdate::ToolResult { name, result } => {
+                    AiUpdate::ToolResult { result, .. } => {
                         if let Some((t_name, t_args)) = last_tool_call.take() {
                             inner_tool_calls.push(step::ToolCallRecord {
                                 name: t_name,
                                 args: t_args,
-                                result,
+                                result: result.clone(),
                             });
                         }
                     }
-                    AiUpdate::Usage(u) => inner_usage = Some(u),
-                    AiUpdate::Error(e) => return Err(e),
-                    AiUpdate::Finished => break,
-                    AiUpdate::PendingApproval { .. } => {} 
-                    AiUpdate::RequestInput { .. } => {}
+                    AiUpdate::Usage(u) => inner_usage = Some(u.clone()),
+                    AiUpdate::Error(_) => {
+                        should_break = true;
+                    }
+                    AiUpdate::Finished => {
+                        should_break = true;
+                    }
+                    _ => {}
+                }
+
+                // Forward to UI (moves update)
+                let _ = tx_out_clone.send(update).await;
+                if should_break {
+                    break;
                 }
             }
             Ok((inner_output, inner_tool_calls, inner_usage))
@@ -281,10 +376,15 @@ impl Pipeline {
     }
 
 
-    /// Simple single-agent chat (for Phase 1 compatibility).
+    /// Simple single-agent chat.
     /// Sends user message to the Coder agent and returns the response.
     pub async fn chat(&self, user_message: &str) -> String {
-        let result = self.execute_agent(AgentRole::Coder, user_message, None).await;
+        let result = if let Some(agent) = self.agents.get(&AgentRole::Coder) {
+            let (tx, mut _rx) = mpsc::channel(100);
+            agent.process(self, user_message, None, tx).await
+        } else {
+            self.execute_agent(AgentRole::Coder, user_message, None).await
+        };
 
         // Store in context
         self.context.write().await.add_output(
@@ -296,139 +396,89 @@ impl Pipeline {
     }
 
     /// Multi-agent pipeline: orchestrator decomposes, then agents execute.
-    /// For Phase 1, this is a simplified version that runs sequentially.
     pub async fn multi_agent(&self, user_message: &str) -> Vec<StepResult> {
-        let mut results = Vec::new();
+        let mut results: Vec<StepResult> = Vec::new();
+        let roles = [AgentRole::Planner, AgentRole::Coder, AgentRole::Reviewer];
 
-        // Step 1: Planner analyzes the task
-        let plan_result = self
-            .execute_agent(AgentRole::Planner, user_message, None)
-            .await;
-        self.context.write().await
-            .add_output("planner".into(), plan_result.output.clone());
-        results.push(plan_result);
+        for role in roles {
+            let prompt = if results.is_empty() {
+                user_message.to_string()
+            } else {
+                let prev_output = results.last().unwrap().output.clone();
+                match role {
+                    AgentRole::Coder => format!("Based on this plan:\n{}\n\nImplement the changes.", prev_output),
+                    AgentRole::Reviewer => format!("Review these changes:\n{}", prev_output),
+                    _ => user_message.to_string(),
+                }
+            };
 
-        // Step 2: Coder implements
-        let code_prompt = format!(
-            "Based on this plan:\n{}\n\nImplement the changes.",
-            self.context.read().await.get_output("planner").unwrap_or_default()
-        );
-        let code_result = self
-            .execute_agent(AgentRole::Coder, &code_prompt, None)
-            .await;
-        self.context.write().await
-            .add_output("coder".into(), code_result.output.clone());
-        results.push(code_result);
+            let (tx, mut _rx) = mpsc::channel(100);
+            let result = if let Some(agent) = self.agents.get(&role) {
+                agent.process(self, &prompt, None, tx).await
+            } else {
+                self.execute_agent(role, &prompt, None).await
+            };
 
-        // Step 3: Reviewer checks
-        let review_prompt = format!(
-            "Review these changes:\n{}",
-            self.context.read().await.get_output("coder").unwrap_or_default()
-        );
-        let review_result = self
-            .execute_agent(AgentRole::Reviewer, &review_prompt, None)
-            .await;
-        self.context.write().await
-            .add_output("reviewer".into(), review_result.output.clone());
-        results.push(review_result);
+            self.context.write().await
+                .add_output(role.as_str().to_string(), result.output.clone());
+            results.push(result);
+        }
 
         results
     }
 
     /// Orchestrate a task by decomposing it into sub-tasks and executing them.
-    pub async fn orchestrate(&self, user_message: &str, tx_out: mpsc::UnboundedSender<AiUpdate>) {
+    pub async fn orchestrate(&self, user_message: &str, tx_out: mpsc::Sender<AiUpdate>) {
         let pipeline_id = crate::worktree::WorktreeManager::new_pipeline_id();
-        let _ = tx_out.send(AiUpdate::Content(format!("🎯 Orchestrating task (ID: {})...\n", pipeline_id)));
+        let _ = tx_out.send(AiUpdate::Content(format!("🎯 Orchestrating task (ID: {})...\n", pipeline_id))).await;
 
         // Create worktree for this orchestration
         let worktree_dir = {
             let mut wtm = self.worktree_manager.write().await;
             match wtm.create_worktree(&pipeline_id, user_message) {
                 Ok(path) => {
-                    let _ = tx_out.send(AiUpdate::Content(format!("🛠️ Isolated worktree created at: {}\n", path.display())));
+                    let _ = tx_out.send(AiUpdate::Content(format!("🛠️ Isolated worktree created at: {}\n", path.display()))).await;
                     path
                 }
                 Err(e) => {
-                    let _ = tx_out.send(AiUpdate::Content(format!("⚠️ Failed to create worktree: {}. Using repo root.\n", e)));
+                    let _ = tx_out.send(AiUpdate::Content(format!("⚠️ Failed to create worktree: {}. Using repo root.\n", e))).await;
                     self.working_dir.clone()
                 }
             }
         };
 
         // 1. Decompose task using Orchestrator agent
-        let decomposition_prompt = format!(
-            "Decompose the following user request into a list of sub-tasks. \
-            Output ONLY a JSON array of objects with 'id', 'agent' (role), and 'description'. \
-            Available agents: planner, researcher, architect, coder, reviewer, qa, executor.\n\n\
-            Request: {}",
-            user_message
-        );
-
-        let decomposition_result = self
-            .execute_agent(AgentRole::Orchestrator, &decomposition_prompt, Some(worktree_dir.clone()))
-            .await;
-
-        if decomposition_result.status == StepStatus::Failed {
-            let _ = tx_out.send(AiUpdate::Error(format!(
-                "Orchestration failed: {}",
-                decomposition_result.output
-            )));
-            return;
-        }
-
-        let _ = tx_out.send(AiUpdate::Content(format!(
-            "✅ Task decomposed: \n{}\n\n",
-            decomposition_result.output
-        )));
-
-        // Try to parse the plan
-        let plan_json = decomposition_result.output.trim();
-        // Basic extraction if AI wraps in code blocks
-        let plan_json = if plan_json.starts_with("```json") {
-            plan_json.trim_start_matches("```json").trim_end_matches("```")
-        } else if plan_json.starts_with("```") {
-            plan_json.trim_start_matches("```").trim_end_matches("```")
-        } else {
-            plan_json
-        };
-
-        let plan: Vec<serde_json::Value> = match serde_json::from_str(plan_json) {
+        let orchestrator = crate::agents::orchestrator::OrchestratorAgent;
+        let plan = match orchestrator.decompose(self, user_message, Some(worktree_dir.clone()), tx_out.clone()).await {
             Ok(p) => p,
-            Err(_) => {
-                let _ = tx_out.send(AiUpdate::Content(
-                    "⚠️ Could not parse structured plan. Falling back to sequential execution.\n"
-                        .into(),
-                ));
-                // Fallback to a simple sequence
-                vec![
-                    serde_json::json!({"agent": "planner", "description": "Create a plan"}),
-                    serde_json::json!({"agent": "coder", "description": "Implement the changes"}),
-                    serde_json::json!({"agent": "reviewer", "description": "Review the code"}),
-                ]
+            Err(e) => {
+                let _ = tx_out.send(AiUpdate::Content(format!("⚠️ Failed to parse structured plan: {}. Falling back to sequential execution.\n", e))).await;
+                // Fallback plan
+                crate::agents::orchestrator::ExecutionPlan {
+                    task_summary: "Sequential execution".into(),
+                    steps: vec![
+                        crate::agents::orchestrator::PlanStep { id: 1, agent: AgentRole::Planner, description: "Create a plan".into(), depends_on: vec![] },
+                        crate::agents::orchestrator::PlanStep { id: 2, agent: AgentRole::Coder, description: "Implement the changes".into(), depends_on: vec![1] },
+                        crate::agents::orchestrator::PlanStep { id: 3, agent: AgentRole::Reviewer, description: "Review the code".into(), depends_on: vec![2] },
+                    ]
+                }
             }
         };
 
-        // 2. Execute sub-tasks
-        for task in plan {
-            let agent_str = task["agent"].as_str().unwrap_or("coder");
-            let description = task["description"].as_str().unwrap_or("");
+        let _ = tx_out.send(AiUpdate::Content(format!("✅ Plan established: {}\n", plan.task_summary))).await;
 
-            let role = match agent_str {
-                "planner" => AgentRole::Planner,
-                "researcher" => AgentRole::Researcher,
-                "architect" => AgentRole::Architect,
-                "coder" => AgentRole::Coder,
-                "reviewer" => AgentRole::Reviewer,
-                "qa" => AgentRole::Qa,
-                "executor" => AgentRole::Executor,
-                _ => AgentRole::Coder,
-            };
+        // 2. Execute sub-tasks
+        let mut completed_ids = Vec::new();
+        for step in plan.steps {
+            let role = step.agent;
+            let description = step.description;
 
             let _ = tx_out.send(AiUpdate::Content(format!(
-                "\n--- 🤖 Executing {}: {} ---\n",
+                "\n--- 🤖 Step {}: {} ({}) ---\n",
+                step.id,
                 role.display_name(),
                 description
-            )));
+            ))).await;
 
             // Use context from previous steps
             let task_prompt = format!(
@@ -437,34 +487,27 @@ impl Pipeline {
             );
 
             // Execute and capture output
-            let step_result = self.execute_agent(role, &task_prompt, Some(worktree_dir.clone())).await;
+            let step_result = if let Some(agent) = self.agents.get(&role) {
+                agent.process(self, &task_prompt, Some(worktree_dir.clone()), tx_out.clone()).await
+            } else {
+                self.execute_agent_with_streaming(role, &task_prompt, Some(worktree_dir.clone()), tx_out.clone()).await
+            };
             
-            // Forward content to UI
-            let _ = tx_out.send(AiUpdate::Content(step_result.output.clone()));
-            
-            // Forward usage and tool info
-            if let Some(u) = step_result.usage {
-                let _ = tx_out.send(AiUpdate::Usage(u));
-            }
-            for call in step_result.tool_calls {
-                let _ = tx_out.send(AiUpdate::ToolCall { name: call.name.clone(), args: call.args });
-                let _ = tx_out.send(AiUpdate::ToolResult { name: call.name, result: call.result });
-            }
-
             // Store result in context for next steps
-            self.context.write().await.add_output(agent_str.to_string(), step_result.output);
+            self.context.write().await.add_output(format!("{}_{}", role.as_str(), step.id), step_result.output);
+            completed_ids.push(step.id);
         }
 
 
-        let _ = tx_out.send(AiUpdate::Content("\n🏁 Orchestration complete.\n".into()));
-        let _ = tx_out.send(AiUpdate::Finished);
+        let _ = tx_out.send(AiUpdate::Content("\n🏁 Orchestration complete.\n".into())).await;
+        let _ = tx_out.send(AiUpdate::Finished).await;
     }
 
     /// Merge a worktree back into the main branch.
-    pub async fn merge_worktree(&self, pipeline_id: &str, tx_out: mpsc::UnboundedSender<AiUpdate>) {
+    pub async fn merge_worktree(&self, pipeline_id: &str, tx_out: mpsc::Sender<AiUpdate>) {
         let wtm = self.worktree_manager.read().await;
         if let Some(info) = wtm.get_worktree(pipeline_id) {
-            let _ = tx_out.send(AiUpdate::Content(format!("🔄 Merging worktree '{}' (branch: {})...\n", pipeline_id, info.branch)));
+            let _ = tx_out.send(AiUpdate::Content(format!("🔄 Merging worktree '{}' (branch: {})...\n", pipeline_id, info.branch))).await;
             
             match crate::worktree::merge::merge_branch(
                 &self.working_dir,
@@ -474,18 +517,18 @@ impl Pipeline {
             ) {
                 Ok(result) => {
                     if result.success {
-                        let _ = tx_out.send(AiUpdate::Content(format!("✅ Merge successful:\n{}\n", result.message)));
+                        let _ = tx_out.send(AiUpdate::Content(format!("✅ Merge successful:\n{}\n", result.message))).await;
                     } else {
-                        let _ = tx_out.send(AiUpdate::Content(format!("❌ Merge conflicts:\n{}\nConflicting files:\n{:#?}\n", result.message, result.conflicting_files)));
+                        let _ = tx_out.send(AiUpdate::Content(format!("❌ Merge conflicts:\n{}\nConflicting files:\n{:#?}\n", result.message, result.conflicting_files))).await;
                     }
                 }
                 Err(e) => {
-                    let _ = tx_out.send(AiUpdate::Error(format!("Failed to execute merge: {}", e)));
+                    let _ = tx_out.send(AiUpdate::Error(format!("Failed to execute merge: {}", e))).await;
                 }
             }
         } else {
-            let _ = tx_out.send(AiUpdate::Error(format!("Worktree '{}' not found. Ensure the ID is correct.", pipeline_id)));
+            let _ = tx_out.send(AiUpdate::Error(format!("Worktree '{}' not found. Ensure the ID is correct.", pipeline_id))).await;
         }
-        let _ = tx_out.send(AiUpdate::Finished);
+        let _ = tx_out.send(AiUpdate::Finished).await;
     }
 }

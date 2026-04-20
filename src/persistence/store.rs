@@ -100,16 +100,14 @@ impl SessionStore {
         for entry in std::fs::read_dir(&self.base_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "json") {
-                if let Ok(json) = std::fs::read_to_string(&path) {
-                    if let Ok(record) = serde_json::from_str::<PipelineRecord>(&json) {
+            if path.extension().is_some_and(|ext| ext == "json")
+                && let Ok(json) = std::fs::read_to_string(&path)
+                    && let Ok(record) = serde_json::from_str::<PipelineRecord>(&json) {
                         let age = now.signed_duration_since(record.updated_at);
                         if age.num_seconds() < self.ttl.as_secs() as i64 {
                             records.push(record);
                         }
                     }
-                }
-            }
         }
 
         // Sort by most recently updated
@@ -129,7 +127,7 @@ impl SessionStore {
         for entry in std::fs::read_dir(&self.base_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "json") {
+            if path.extension().is_some_and(|ext| ext == "json") {
                 let should_remove = match std::fs::read_to_string(&path) {
                     Ok(json) => match serde_json::from_str::<PipelineRecord>(&json) {
                         Ok(record) => {

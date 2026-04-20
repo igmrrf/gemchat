@@ -8,10 +8,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
+use serde::{Deserialize, Serialize};
 use syntect::{
     easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet, util::LinesWithEndings,
 };
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 use tui_textarea::TextArea;
@@ -21,6 +21,7 @@ mod ai;
 
 // New multi-agent modules
 mod agents;
+mod app_terminal;
 mod cli;
 mod config;
 mod persistence;
@@ -28,13 +29,12 @@ mod pipeline;
 mod provider;
 mod tools;
 mod worktree;
-mod app_terminal;
 
+use crate::agents::AgentRole;
+use crate::app_terminal::EmbeddedTerminal;
 use crate::cli::Cli;
 use crate::pipeline::Pipeline;
-use crate::agents::AgentRole;
 use crate::provider::AiUpdate;
-use crate::app_terminal::EmbeddedTerminal;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -53,8 +53,14 @@ enum Action {
     AiResponseError(String),
     AiResponseFinish,
     UpdateUsage(crate::provider::Usage),
-    ToolCall { name: String, args: String },
-    ToolResult { name: String, result: String },
+    ToolCall {
+        name: String,
+        args: String,
+    },
+    ToolResult {
+        name: String,
+        result: String,
+    },
     PendingApproval {
         name: String,
         args: String,
@@ -112,7 +118,11 @@ struct App<'a> {
 }
 
 impl<'a> App<'a> {
-    fn new(action_tx: mpsc::UnboundedSender<Action>, pipeline: Pipeline, store: crate::persistence::SessionStore) -> Self {
+    fn new(
+        action_tx: mpsc::UnboundedSender<Action>,
+        pipeline: Pipeline,
+        store: crate::persistence::SessionStore,
+    ) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_block(Block::default().borders(Borders::ALL).title("Input"));
         textarea.set_placeholder_text("Type message... (Enter to send, Esc to quit)");
@@ -121,12 +131,10 @@ impl<'a> App<'a> {
 
         Self {
             textarea,
-            messages: vec![
-                Message {
-                    role: "System".into(),
-                    content: "Welcome to GemChat!".into(),
-                },
-            ],
+            messages: vec![Message {
+                role: "System".into(),
+                content: "Welcome to GemChat!".into(),
+            }],
             should_quit: false,
             action_tx,
             is_loading: false,
@@ -150,7 +158,6 @@ impl<'a> App<'a> {
 
     fn update(&mut self, action: Action) -> Result<()> {
         match action {
-            Action::Quit => self.should_quit = true,
             Action::Tick => {
                 if self.is_loading {
                     self.spinner_index = (self.spinner_index + 1) % SPINNER_FRAMES.len();
@@ -158,11 +165,10 @@ impl<'a> App<'a> {
 
                 // Check if terminal child exited
                 let mut finished_text = None;
-                if let Some(term) = &mut self.embedded_terminal {
-                    if let Ok(Some(_)) = term.child.try_wait() {
+                if let Some(term) = &mut self.embedded_terminal
+                    && let Ok(Some(_)) = term.child.try_wait() {
                         finished_text = Some(term.screen_text());
                     }
-                }
                 if let Some(text) = finished_text {
                     let _ = self.action_tx.send(Action::TerminalExit(text));
                 }
@@ -216,7 +222,8 @@ impl<'a> App<'a> {
                             };
 
                             // Handle Alt/Meta if needed (simplification)
-                            if key.modifiers.contains(event::KeyModifiers::ALT) && !bytes.is_empty() {
+                            if key.modifiers.contains(event::KeyModifiers::ALT) && !bytes.is_empty()
+                            {
                                 bytes.insert(0, 27);
                             }
 
@@ -230,7 +237,9 @@ impl<'a> App<'a> {
                             KeyCode::Esc => {
                                 self.input_mode = InputMode::Normal;
                             }
-                            KeyCode::Enter if !key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                            KeyCode::Enter
+                                if !key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                            {
                                 let input = self.textarea.lines().join("\n");
                                 if !input.trim().is_empty() {
                                     self.messages.push(Message {
@@ -271,17 +280,23 @@ impl<'a> App<'a> {
                         KeyCode::Char('i') if self.pending_approval.is_some() => {
                             // Manual override: Approve as interactive
                             if let Some((name, args)) = self.pending_approval.take() {
-                                let mut val: serde_json::Value = serde_json::from_str(&args).unwrap_or(serde_json::json!({}));
+                                let mut val: serde_json::Value =
+                                    serde_json::from_str(&args).unwrap_or(serde_json::json!({}));
                                 if let serde_json::Value::Object(ref mut obj) = val {
-                                    obj.insert("interactive".to_string(), serde_json::Value::Bool(true));
+                                    obj.insert(
+                                        "interactive".to_string(),
+                                        serde_json::Value::Bool(true),
+                                    );
                                 }
                                 let new_args = val.to_string();
-                                
+
                                 // We need a way to tell the pipeline to run this interactively.
                                 // The simplest way is to send a NEW action that includes the updated args.
                                 // But Pipeline is already waiting on approval_tx.
                                 // We'll update ApproveTool to optionally take updated args.
-                                let _ = self.action_tx.send(Action::ApproveToolWithArgs(true, name, new_args));
+                                let _ = self
+                                    .action_tx
+                                    .send(Action::ApproveToolWithArgs(true, name, new_args));
                             }
                         }
                         KeyCode::Char('i') => self.input_mode = InputMode::Editing,
@@ -326,11 +341,19 @@ impl<'a> App<'a> {
                     if clean_text == "y" || clean_text == "yes" {
                         if is_interactive {
                             if let Some((name, args)) = self.pending_approval.take() {
-                                let mut val: serde_json::Value = serde_json::from_str(&args).unwrap_or(serde_json::json!({}));
+                                let mut val: serde_json::Value =
+                                    serde_json::from_str(&args).unwrap_or(serde_json::json!({}));
                                 if let serde_json::Value::Object(ref mut obj) = val {
-                                    obj.insert("interactive".to_string(), serde_json::Value::Bool(true));
+                                    obj.insert(
+                                        "interactive".to_string(),
+                                        serde_json::Value::Bool(true),
+                                    );
                                 }
-                                let _ = self.action_tx.send(Action::ApproveToolWithArgs(true, name, val.to_string()));
+                                let _ = self.action_tx.send(Action::ApproveToolWithArgs(
+                                    true,
+                                    name,
+                                    val.to_string(),
+                                ));
                             }
                         } else {
                             let _ = self.action_tx.send(Action::ApproveTool(true));
@@ -361,9 +384,9 @@ impl<'a> App<'a> {
 
                 let tx = self.action_tx.clone();
                 let pipeline = self.pipeline.clone();
-                
+
                 tokio::spawn(async move {
-                    let (ai_tx, mut ai_rx) = mpsc::unbounded_channel();
+                    let (ai_tx, mut ai_rx) = mpsc::channel(100);
 
                     if text.starts_with("/orchestrate") || text.starts_with("/plan") {
                         let prompt = if text.starts_with("/orchestrate") {
@@ -371,26 +394,32 @@ impl<'a> App<'a> {
                         } else {
                             text.trim_start_matches("/plan").trim().to_string()
                         };
-                        
+
+                        let tx_clone = ai_tx.clone();
                         tokio::spawn(async move {
-                            pipeline.orchestrate(&prompt, ai_tx).await;
+                            pipeline.orchestrate(&prompt, tx_clone).await;
                         });
                     } else if text == "/clear" {
-                        let _ = pipeline.context.write().await.clear();
-                        let _ = ai_tx.send(AiUpdate::Content("🧹 Context cleared.".into()));
-                        let _ = ai_tx.send(AiUpdate::Finished);
+                        pipeline.context.write().await.clear();
+                        let _ = ai_tx.send(AiUpdate::Content("🧹 Context cleared.".into())).await;
+                        let _ = ai_tx.send(AiUpdate::Finished).await;
                     } else if text.starts_with("/merge") {
                         let pipeline_id = text.trim_start_matches("/merge").trim().to_string();
                         if pipeline_id.is_empty() {
-                            let _ = ai_tx.send(AiUpdate::Error("Usage: /merge <pipeline_id>".into()));
+                            let _ =
+                                ai_tx.send(AiUpdate::Error("Usage: /merge <pipeline_id>".into())).await;
                         } else {
+                            let tx_clone = ai_tx.clone();
                             tokio::spawn(async move {
-                                pipeline.merge_worktree(&pipeline_id, ai_tx).await;
+                                pipeline.merge_worktree(&pipeline_id, tx_clone).await;
                             });
                         }
                     } else {
+                        let tx_clone = ai_tx.clone();
                         tokio::spawn(async move {
-                            pipeline.stream_agent(AgentRole::Coder, &text, &pipeline.working_dir, ai_tx).await;
+                            pipeline
+                                .stream_agent(AgentRole::Coder, &text, &pipeline.working_dir, tx_clone)
+                                .await;
                         });
                     }
 
@@ -410,10 +439,22 @@ impl<'a> App<'a> {
                             AiUpdate::ToolCall { name, args } => {
                                 let _ = tx.send(Action::ToolCall { name, args });
                             }
-                            AiUpdate::PendingApproval { name, args, tx: app_tx } => {
-                                let _ = tx.send(Action::PendingApproval { name, args, tx: app_tx });
+                            AiUpdate::PendingApproval {
+                                name,
+                                args,
+                                tx: app_tx,
+                            } => {
+                                let _ = tx.send(Action::PendingApproval {
+                                    name,
+                                    args,
+                                    tx: app_tx,
+                                });
                             }
-                            AiUpdate::RequestInput { name: _, args, tx: in_tx } => {
+                            AiUpdate::RequestInput {
+                                name: _,
+                                args,
+                                tx: in_tx,
+                            } => {
                                 let _ = tx.send(Action::RequestInput { args, tx: in_tx });
                             }
                             AiUpdate::ToolResult { name, result } => {
@@ -438,12 +479,11 @@ impl<'a> App<'a> {
             }
             Action::AiResponseChunk(chunk) => {
                 let mut needs_new = true;
-                if let Some(last_msg) = self.messages.last_mut() {
-                    if last_msg.role == "AI" {
+                if let Some(last_msg) = self.messages.last_mut()
+                    && last_msg.role == "AI" {
                         last_msg.content.push_str(&chunk);
                         needs_new = false;
                     }
-                }
                 if needs_new {
                     self.messages.push(Message {
                         role: "AI".into(),
@@ -501,9 +541,14 @@ impl<'a> App<'a> {
                 self.approval_tx = Some(tx);
             }
             Action::RequestInput { args, tx } => {
-                let val: serde_json::Value = serde_json::from_str(&args).unwrap_or(serde_json::Value::Null);
-                let cmd_str = val.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                
+                let val: serde_json::Value =
+                    serde_json::from_str(&args).unwrap_or(serde_json::Value::Null);
+                let cmd_str = val
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
                 if cmd_str.is_empty() {
                     let _ = tx.send("Error: No command provided".into());
                     return Ok(());
@@ -541,65 +586,68 @@ impl<'a> App<'a> {
                 self.input_mode = InputMode::Editing;
                 self.auto_save();
             }
-            Action::ListSessions => {
-                match self.store.load_active_pipelines() {
-                    Ok(records) => {
-                        let mut msg = String::from("### Recent Sessions\n\n");
-                        if records.is_empty() {
-                            msg.push_str("No active sessions found.\n");
-                        } else {
-                            for r in records.iter().take(10) {
-                                msg.push_str(&format!("- **{}** ({}): {} tokens\n", r.id, r.updated_at.format("%Y-%m-%d %H:%M"), r.total_tokens));
-                            }
-                            msg.push_str("\n*Use `/load <id>` to resume a session.*");
+            Action::ListSessions => match self.store.load_active_pipelines() {
+                Ok(records) => {
+                    let mut msg = String::from("### Recent Sessions\n\n");
+                    if records.is_empty() {
+                        msg.push_str("No active sessions found.\n");
+                    } else {
+                        for r in records.iter().take(10) {
+                            msg.push_str(&format!(
+                                "- **{}** ({}): {} tokens\n",
+                                r.id,
+                                r.updated_at.format("%Y-%m-%d %H:%M"),
+                                r.total_tokens
+                            ));
                         }
-                        self.messages.push(Message {
-                            role: "System".into(),
-                            content: msg,
-                        });
-                        if self.should_auto_scroll {
-                            self.scroll_to_bottom();
-                        }
+                        msg.push_str("\n*Use `/load <id>` to resume a session.*");
                     }
-                    Err(e) => {
-                        self.messages.push(Message {
-                            role: "Error".into(),
-                            content: format!("Failed to list sessions: {}", e),
-                        });
+                    self.messages.push(Message {
+                        role: "System".into(),
+                        content: msg,
+                    });
+                    if self.should_auto_scroll {
+                        self.scroll_to_bottom();
                     }
                 }
-            }
-            Action::LoadSession(id) => {
-                match self.store.load_pipeline(&id) {
-                    Ok(record) => {
-                        self.session_id = record.id.clone();
-                        let mut loaded_msgs = Vec::new();
-                        for val in record.messages {
-                            if let Ok(msg) = serde_json::from_value(val) {
-                                loaded_msgs.push(msg);
-                            }
-                        }
-                        self.messages = loaded_msgs;
-                        self.messages.push(Message {
-                            role: "System".into(),
-                            content: format!("✅ Session {} loaded successfully.", id),
-                        });
-                        if self.should_auto_scroll {
-                            self.scroll_to_bottom();
+                Err(e) => {
+                    self.messages.push(Message {
+                        role: "Error".into(),
+                        content: format!("Failed to list sessions: {}", e),
+                    });
+                }
+            },
+            Action::LoadSession(id) => match self.store.load_pipeline(&id) {
+                Ok(record) => {
+                    self.session_id = record.id.clone();
+                    let mut loaded_msgs = Vec::new();
+                    for val in record.messages {
+                        if let Ok(msg) = serde_json::from_value(val) {
+                            loaded_msgs.push(msg);
                         }
                     }
-                    Err(e) => {
-                        self.messages.push(Message {
-                            role: "Error".into(),
-                            content: format!("Failed to load session '{}': {}", id, e),
-                        });
+                    self.messages = loaded_msgs;
+                    self.messages.push(Message {
+                        role: "System".into(),
+                        content: format!("✅ Session {} loaded successfully.", id),
+                    });
+                    if self.should_auto_scroll {
+                        self.scroll_to_bottom();
                     }
                 }
+                Err(e) => {
+                    self.messages.push(Message {
+                        role: "Error".into(),
+                        content: format!("Failed to load session '{}': {}", id, e),
+                    });
+                }
+            },
+            Action::Quit => {
+                self.quit();
             }
         }
         Ok(())
     }
-
 
     fn auto_save(&self) {
         let mut record = crate::persistence::store::PipelineRecord::new(
@@ -615,10 +663,22 @@ impl<'a> App<'a> {
             .map(|m| serde_json::to_value(m).unwrap())
             .collect();
 
-        // Capture context snapshot if possible
-        // Since it's async, we might skip it or use a simplified approach
-        
+        // Capture context snapshot
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let pipeline = self.pipeline.clone();
+            let outputs = handle.block_on(async move {
+                let ctx = pipeline.context.read().await;
+                ctx.get_all_outputs()
+            });
+            record.context_snapshot = outputs;
+        }
+
         let _ = self.store.save_pipeline(&record);
+    }
+
+    fn quit(&mut self) {
+        self.auto_save();
+        self.should_quit = true;
     }
 
     fn scroll_up(&mut self) {
@@ -743,7 +803,7 @@ impl<'a> App<'a> {
             vec![
                 Constraint::Percentage(40), // Messages
                 Constraint::Percentage(50), // Terminal
-                Constraint::Length(3),       // Input
+                Constraint::Length(3),      // Input
             ]
         } else {
             vec![
@@ -790,11 +850,10 @@ impl<'a> App<'a> {
             list_items.push(ListItem::new(Line::from(""))); // Spacer
         }
 
-        if self.should_auto_scroll {
-            if !list_items.is_empty() {
+        if self.should_auto_scroll
+            && !list_items.is_empty() {
                 self.list_state.select(Some(list_items.len() - 1));
             }
-        }
 
         let main_title = match self.input_mode {
             InputMode::Editing => "Chat (Editing)",
@@ -813,36 +872,43 @@ impl<'a> App<'a> {
         let input_area_idx = if let Some(term) = &self.embedded_terminal {
             let screen = term.parser.lock().unwrap();
             let term_area = layout[1];
-            
+
             // Manual rendering of vt100 screen to ratatui buffer
             let vt_screen = screen.screen();
             let (rows, cols) = vt_screen.size();
-            
+
             for row in 0..rows.min(term_area.height) {
                 for col in 0..cols.min(term_area.width) {
                     if let Some(cell) = vt_screen.cell(row, col) {
                         let x = term_area.x + col;
                         let y = term_area.y + row;
-                        
+
                         let fg = cell.fgcolor();
                         let bg = cell.bgcolor();
-                        
+
                         let mut style = Style::default();
-                        
+
                         // Map vt100 colors to ratatui colors
-                        if let Some(c) = map_vt100_color(fg) { style = style.fg(c); }
-                        if let Some(c) = map_vt100_color(bg) { style = style.bg(c); }
-                        
-                        if cell.bold() { style = style.add_modifier(Modifier::BOLD); }
-                        if cell.italic() { style = style.add_modifier(Modifier::ITALIC); }
-                        
-                        frame.buffer_mut().cell_mut((x, y)).map(|c| {
-                            c.set_char(cell.contents().chars().next().unwrap_or(' ')).set_style(style);
-                        });
+                        if let Some(c) = map_vt100_color(fg) {
+                            style = style.fg(c);
+                        }
+                        if let Some(c) = map_vt100_color(bg) {
+                            style = style.bg(c);
+                        }
+
+                        if cell.bold() {
+                            style = style.add_modifier(Modifier::BOLD);
+                        }
+                        if cell.italic() {
+                            style = style.add_modifier(Modifier::ITALIC);
+                        }
+
+                        if let Some(c) = frame.buffer_mut().cell_mut((x, y)) { c.set_char(cell.contents().chars().next().unwrap_or(' '))
+                                .set_style(style); }
                     }
                 }
             }
-            
+
             2
         } else {
             1
@@ -850,7 +916,9 @@ impl<'a> App<'a> {
 
         let input_block_style = match self.input_mode {
             InputMode::Editing => Style::default().fg(Color::Yellow),
-            InputMode::Terminal => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            InputMode::Terminal => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
             InputMode::Normal => Style::default().fg(Color::DarkGray),
         };
 
@@ -864,7 +932,9 @@ impl<'a> App<'a> {
         };
 
         let block_style = if self.pending_approval.is_some() {
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
         } else {
             input_block_style
         };
@@ -877,7 +947,10 @@ impl<'a> App<'a> {
         );
 
         if let Some((name, args)) = &self.pending_approval {
-             textarea.set_placeholder_text(format!("Approve tool '{}' with args '{}'? (y)es / (n)o / (i)nteractive", name, args));
+            textarea.set_placeholder_text(format!(
+                "Approve tool '{}' with args '{}'? (y)es / (n)o / (i)nteractive",
+                name, args
+            ));
         }
 
         frame.render_widget(&textarea, layout[input_area_idx]);
@@ -986,9 +1059,7 @@ fn parse_markdown(text: &str, ps: &SyntaxSet, ts: &ThemeSet, width: usize) -> Ve
                 h.highlight_line(code_line, ps).unwrap_or_default();
             let spans: Vec<Span<'static>> = ranges
                 .into_iter()
-                .map(|(style, content)| {
-                    Span::styled(content.to_string(), translate_style(style))
-                })
+                .map(|(style, content)| Span::styled(content.to_string(), translate_style(style)))
                 .collect();
             lines.push(Line::from(spans));
         }
@@ -1055,14 +1126,14 @@ async fn main() -> Result<()> {
 
 async fn run(mut terminal: DefaultTerminal) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    
+
     // Initialize pipeline
     let config = crate::config::load_config()?;
     let model = crate::config::model_for_role(&config, "coder");
     let working_dir = std::env::current_dir()?;
     let store = crate::persistence::SessionStore::new(config.general.persistence_ttl_hours)?;
     let pipeline = Pipeline::new(config, &model, working_dir)?;
-    
+
     let mut app = App::new(tx.clone(), pipeline, store);
 
     // Tick task
@@ -1080,18 +1151,21 @@ async fn run(mut terminal: DefaultTerminal) -> Result<()> {
     let input_tx = tx.clone();
     tokio::task::spawn_blocking(move || {
         loop {
-            if let Ok(Event::Key(key)) = event::read() {
-                if key.kind == KeyEventKind::Press {
-                    if input_tx.send(Action::UserInput(key)).is_err() {
-                        break;
-                    }
-                }
+            if let Ok(true) = event::poll(Duration::from_millis(100)) {
+                if let Ok(Event::Key(key)) = event::read()
+                    && key.kind == KeyEventKind::Press
+                        && input_tx.send(Action::UserInput(key)).is_err() {
+                            break;
+                        }
+            } else if input_tx.is_closed() {
+                // If the main loop has exited, the channel will be closed
+                break;
             }
         }
     });
 
     loop {
-        if let Err(_) = terminal.draw(|frame| app.draw(frame)) {
+        if terminal.draw(|frame| app.draw(frame)).is_err() {
             // Re-init if drawing fails (happens after restore())
             terminal = ratatui::init();
             terminal.draw(|frame| app.draw(frame))?;
